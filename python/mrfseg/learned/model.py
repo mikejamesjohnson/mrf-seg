@@ -13,7 +13,13 @@ statistics are the window's, is kept as `norm="group"` for an ablation.
 
 The head's unary bias starts negative (`PotentialNet.UNARY_BIAS`): lumen is a fraction of a
 percent of the voxels, and a network that begins by calling everything background trains
-smoothly; its coupling bias starts where softplus gives about `COUPLING_INIT`.
+smoothly. Its coupling bias starts where softplus gives `COUPLING_INIT`, which is small on
+purpose: with couplings near 1 the mean field drives every marginal to the all-background
+consensus (six neighbours near 0 each add about -w to the logit), the sigmoids saturate, and
+almost no gradient reaches the unary through the sweeps -- the network then learns to smooth
+harder rather than to find lumen. Near 0.1 the sweeps are almost the identity at first, the
+gradient flows, and the network raises the couplings where smoothing helps once the unary has
+learned something.
 """
 
 from __future__ import annotations
@@ -148,8 +154,9 @@ class PotentialNet(nn.Module):
     #: Where the head's unary bias starts: sigmoid(-4) = 2 %, more than the lumen's share of a
     #: vessel-centred patch but near enough that the first steps are not spent getting there.
     UNARY_BIAS = -4.0
-    #: What the couplings start at, about: softplus of the head's coupling bias.
-    COUPLING_INIT = 1.0
+    #: What the couplings start at: softplus of the head's coupling bias. Small, so the first
+    #: sweeps are nearly the identity and the gradient reaches the unary (see the module docstring).
+    COUPLING_INIT = 0.1
 
     def __init__(self, cfg: UNet3DConfig = UNet3DConfig()) -> None:
         super().__init__()

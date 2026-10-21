@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> None:
             loss, stats = segmentation_loss(raw, batch["label"].to(device), batch["clicks"].to(device), args.sweeps, args.unary_weight, args.checkpoint_sweeps)
             scaler.scale(loss / args.accumulate).backward()
             count += 1
-            for k, v in dict(loss=float(loss), **stats).items():
+            for k, v in dict(loss=float(loss.detach()), **stats).items():
                 running[k] = running.get(k, 0.0) + v
             if count % args.accumulate:
                 continue

@@ -146,7 +146,7 @@ $$
 
 - $s$ (`unary_shift`) and $\lambda$ (`coupling`) are the editor's knobs, 0 and 1 as trained;
 - softplus keeps every coupling non-negative, so the energy stays submodular;
-- the head's unary bias starts at $-4$ (lumen is rare) and its coupling bias where softplus gives 1.
+- the head's unary bias starts at $-4$ (lumen is rare) and its coupling bias where softplus gives 0.1: small, so the first sweeps are nearly the identity and the gradient reaches the unary; with couplings near 1 the mean field saturates at the all-background consensus and the network learns to smooth harder instead of finding lumen.
 
 The network runs once per image, in overlapping 96³ windows blended with Gaussian weights; its
 output is kept as the image's "features", and a Generate is the inference alone. The couplings

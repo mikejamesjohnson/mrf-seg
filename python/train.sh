@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train the potentials network on the 0.5 mm cache, on a machine with a GPU.
 #
-#   ./train.sh sanity /path/to/pseg3d/data/casx/cache     # ~10 minutes: 300 steps, one validation; checks memory and that the loss falls
+#   ./train.sh sanity /path/to/pseg3d/data/casx/cache     # a few minutes: the first 400 steps of the real schedule, one validation
 #   ./train.sh full   /path/to/pseg3d/data/casx/cache     # the real run: 40 000 steps, validating every 2000; resumable
 #   ./train.sh eval   /path/to/pseg3d/data/casx/cache     # the simulated user on 20 test scans, Learned against Basic
 #
@@ -23,8 +23,12 @@ EXTRA="${EXTRA:-}"
 
 case "$MODE" in
   sanity)
-    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "${OUT}-sanity" --steps 300 --warmup 50 \
-      --log-every 25 --val-every 300 --val-cases 4 --val-clicks 3 --workers 8 $EXTRA
+    # The real schedule (40 000 steps, a short warm-up), stopped after 400: the learning rate is
+    # then the full run's, not a 300-step cosine's, so what the loss and the Dice do is what the
+    # full run would do in its first minutes.
+    rm -rf "${OUT}-sanity"
+    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "${OUT}-sanity" --steps 40000 --stop-after 400 --warmup 100 \
+      --log-every 25 --val-every 400 --val-cases 4 --val-clicks 3 --workers 8 $EXTRA
     ;;
   full)
     ARGS=(--cache "$CACHE" --out "$OUT" --steps 40000 --batch 4 --workers 8 --val-every 2000)
