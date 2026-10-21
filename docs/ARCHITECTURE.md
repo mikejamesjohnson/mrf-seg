@@ -160,8 +160,10 @@ resampled HU is kept beside the features for the contrast-sensitive coupling.
   with simulated clicks clamped), so that the marginals reproduce the label map. It takes HU on
   a fixed window at 0.5 mm, normalises per voxel over its channels (`model.ChannelNorm`) rather
   than over the patch, and runs in windows of the training patch size (96³), half overlap,
-  Gaussian blending (`windows.py`). Its output is kept as the image's features, so a Generate is
-  the inference alone; the potentials are the unary plus `unary_shift`, and `coupling` times the
+  Gaussian blending (`windows.py`), with empty click maps: the automatic potentials, kept as the
+  image's features. A Generate with points re-runs it in windows centred on the points, with the
+  click maps as input (`learned.network_input`), and blends the result into those
+  (`Learned.refine`); the potentials are the unary plus `unary_shift`, and `coupling` times the
   softplus of the raw couplings (`model.PotentialNet.potentials`). The checkpoint is
   `$MRFSEG_LEARNED_WEIGHTS` or `~/.cache/mrfseg/learned.pt`, loaded once per version of the
   file; it carries its config, the spacing, and the settings the editor should start from
@@ -183,9 +185,11 @@ unary and the mean coupling at each voxel -- are read back onto the CT's grid a 
 
 **Generate** (`MRFSegmentation.generate_segmentation`) extracts the features if they are not
 there, builds the potentials from them and the points, clamps the points' voxels, runs the
-sweeps, and reads the maps onto the CT's grid: the values the user sees are the values used, and
-the same points and settings give the same maps. There is no Optimize: the handcrafted
-potentials have no fit, and the network's is its training.
+sweeps, keeps what the inside points connect to if `connected` is on (`select_connected`: the
+face-connected components of {p >= 0.5} holding an inside point; p is set to 0 on the others),
+and reads the maps onto the CT's grid: the values the user sees are the values used, and the
+same points and settings give the same maps. There is no Optimize: the handcrafted potentials
+have no fit, and the network's is its training.
 
 **The server** wraps the core, which has no HTTP or UI code. Feature extraction and Generate run
 on background threads (one Generate at a time), and the editor polls the session for progress
@@ -238,9 +242,8 @@ rebinding). The editor's routes (`lib/server/local.ts`) serve only its own page,
   through `build`, which reports in the product's slice of state (`Product`), refuses when there
   is no session or no segmentation under it, and stores the result only if its image is still
   open. Every step's button is off while anything runs (`isBusy`).
-  - **Labelmap**: the backend thresholds p on its exact maps and, if asked, keeps only the
-    connected components an inside point touches; the labels come back as uint8 and are stored
-    as a labelmap dataset, drawn like a map but in one colour, without interpolation.
+  - **Labelmap**: the backend thresholds p on its exact maps; the labels come back as uint8 and
+    are stored as a labelmap dataset, drawn like a map but in one colour, without interpolation.
   - **Surface**: the backend runs marching cubes on a map; the mesh comes back as one binary
     buffer and is stored as a mesh dataset. In 3D the mesh is drawn; in a slice view, where the
     view's plane cuts it (`meshPlaneSegments`).

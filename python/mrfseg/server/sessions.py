@@ -130,8 +130,8 @@ class Session:
     def build_surface(self, source: str, level: float | None) -> vtkPolyData:
         return self._build("surface", lambda: self.segmentation.extract_surface(source, level))
 
-    def build_labelmap(self, threshold: float, connected: bool) -> vtkImageData:
-        return self._build("labelmap", lambda: self.segmentation.labelmap(threshold, connected))
+    def build_labelmap(self, threshold: float) -> vtkImageData:
+        return self._build("labelmap", lambda: self.segmentation.labelmap(threshold))
 
     def _build(self, name: str, make):
         """A product of the last result, kept under `name`; a NotReady if there is no result or
@@ -255,7 +255,7 @@ def _finite_range(name: str, values: np.ndarray) -> tuple[float, float]:
 
 def _inference_summary(inference: InferenceSummary) -> dict:
     """`InferenceSummary` in `src/lib/segmentation/state.ts`: how the mean field ended."""
-    return {"sweeps": inference.sweeps, "delta": inference.delta, "converged": inference.converged}
+    return {"sweeps": inference.sweeps, "delta": inference.delta, "converged": inference.converged, "components": inference.components}
 
 
 def _job_summary(segmentation: Segmentation, points: int, ranges: dict[str, tuple[float, float]], scales: dict[str, float]) -> dict:

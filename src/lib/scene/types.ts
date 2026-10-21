@@ -65,14 +65,12 @@ export interface MapDataset extends DatasetCommon, GridInfo {
 
 /**
  * A binary label on an image's grid: 1 where p(y = 1) >= `threshold`, 0 elsewhere, as uint8.
- * Thresholded in the backend on the exact maps, like the surface, so the two agree; with
- * `connected`, only the components holding an inside point are kept.
+ * Thresholded in the backend on the exact maps, like the surface, so the two agree.
  */
 export interface LabelmapDataset extends DatasetCommon, GridInfo {
   kind: "labelmap";
   sourceId: DatasetId;
   threshold: number;
-  connected: boolean;
   /** How many voxels are labelled 1. */
   voxels: number;
 }

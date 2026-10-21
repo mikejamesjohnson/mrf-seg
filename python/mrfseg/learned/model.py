@@ -1,6 +1,7 @@
-"""The network: a 3D U-Net whose four output channels at every voxel are the CRF's potentials
-there -- the unary logit, and the raw couplings to the neighbour along +z, +y and +x, which
-`softplus` makes non-negative (`PotentialNet.potentials`).
+"""The network: a 3D U-Net from the image and the click maps (`learned.network_input`) to four
+output channels at every voxel, the CRF's potentials there -- the unary logit, and the raw
+couplings to the neighbour along +z, +y and +x, which `softplus` makes non-negative
+(`PotentialNet.potentials`).
 
 Five resolutions (a 96^3 patch: 96 -> 48 -> 24 -> 12 -> 6), two 3x3x3 convolutions per level
 with a normalisation and a GELU after each, max-pooling down, transposed convolutions up, skip
@@ -32,7 +33,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..mrf import AXES, Potentials
-from . import SPACING
+from . import IN_CHANNELS, SPACING
 
 #: Output channels: the unary logit and one coupling per axis.
 OUT_CHANNELS = 1 + AXES
@@ -40,6 +41,7 @@ OUT_CHANNELS = 1 + AXES
 
 @dataclass(frozen=True)
 class UNet3DConfig:
+    inputs: int = IN_CHANNELS  # input channels: the image and the two click maps
     base: int = 32          # channels at full resolution, doubled at each level down
     levels: int = 5         # resolutions: 96 -> 48 -> 24 -> 12 -> 6 on a 96^3 patch
     norm: str = "channel"   # "channel": per voxel over its channels; "group": GroupNorm(groups)
@@ -131,7 +133,7 @@ class UNet3D(nn.Module):
     def __init__(self, cfg: UNet3DConfig) -> None:
         super().__init__()
         chans = [cfg.base * 2 ** k for k in range(cfg.levels)]
-        self.down = nn.ModuleList([_Block(1, chans[0], cfg)] + [_Block(chans[k - 1], chans[k], cfg) for k in range(1, cfg.levels)])
+        self.down = nn.ModuleList([_Block(cfg.inputs, chans[0], cfg)] + [_Block(chans[k - 1], chans[k], cfg) for k in range(1, cfg.levels)])
         self.up = nn.ModuleList([nn.ConvTranspose3d(chans[k], chans[k - 1], 2, stride=2) for k in range(cfg.levels - 1, 0, -1)])
         self.merge = nn.ModuleList([_Block(2 * chans[k - 1], chans[k - 1], cfg) for k in range(cfg.levels - 1, 0, -1)])
         self.head = nn.Conv3d(chans[0], OUT_CHANNELS, 1)
@@ -167,7 +169,8 @@ class PotentialNet(nn.Module):
             self.net.head.bias[1:] = math.log(math.expm1(self.COUPLING_INIT))  # softplus^-1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x (B, 1, z, y, x) normalised HU -> (B, 4, z, y, x) raw potentials, float32."""
+        """x (B, inputs, z, y, x), the normalised HU and the click maps (`learned.network_input`) ->
+        (B, 4, z, y, x) raw potentials, float32."""
         stride = self.cfg.stride
         sizes = x.shape[-3:]
         pads = [(-n) % stride for n in sizes]
@@ -206,6 +209,9 @@ def load(path: str, device: str | torch.device = "cpu") -> tuple[PotentialNet, d
     """The model saved at `path`, in eval mode on `device`, and whatever else was saved with it
     (including `spacing`)."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    model = PotentialNet(UNet3DConfig(**blob["config"]))
+    config = dict(blob["config"])
+    # A checkpoint from before the click maps has one input channel: read it off the first convolution.
+    config.setdefault("inputs", int(blob["state"]["net.down.0.net.0.weight"].shape[1]))
+    model = PotentialNet(UNet3DConfig(**config))
     model.load_state_dict(blob["state"])
     return model.to(device).eval(), {k: v for k, v in blob.items() if k not in ("config", "state")}

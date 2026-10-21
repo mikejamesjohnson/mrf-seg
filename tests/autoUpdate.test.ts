@@ -29,7 +29,7 @@ vi.mock("@/lib/segmentation/generate", async () => ({
       scene.getState().setSegmentation({ job: { state: "done", progress: 1 } });
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    const inference = { sweeps: 10, delta: 0.0001, converged: true };
+    const inference = { sweeps: 10, delta: 0.0001, converged: true, components: null };
     scene.getState().setSegmentation({
       job: { state: "done", progress: 1 },
       generation: scene.getState().segmentation.generation + 1,
@@ -51,7 +51,7 @@ vi.mock("@/lib/segmentation/products", async (importOriginal) => {
   const buildSegmentationLabelmap = async () => {
     const s = scene.getState();
     steps.ran.push("labelmap");
-    s.setProduct("labelmap", { built: { threshold: s.labelmap.threshold, connected: s.labelmap.connected, voxels: 0, seconds: 0, generation: s.segmentation.generation } });
+    s.setProduct("labelmap", { built: { threshold: s.labelmap.threshold, voxels: 0, seconds: 0, generation: s.segmentation.generation } });
   };
   const buildSegmentationSurface = async () => {
     const s = scene.getState();
@@ -158,13 +158,11 @@ describe("auto update", () => {
     await upToDate();
     store().setProduct("labelmap", { threshold: 0.7 });
     await finish();
-    store().setProduct("labelmap", { connected: false });
-    await finish();
     store().setProduct("surface", { source: "unary" });
     await finish();
     store().setProduct("surface", { source: "probability", threshold: 0.6 });
     await finish();
-    expect(steps.ran).toEqual(["labelmap", "labelmap", "surface", "surface"]);
+    expect(steps.ran).toEqual(["labelmap", "surface", "surface"]);
   });
 
   it("builds only what is ticked, and a product once it is ticked", async () => {

@@ -1,17 +1,19 @@
 """Learned, the trained network as a `FeatureExtractor` for the editor, and its potentials.
 
-Its "features" are the network's four raw output channels per voxel (`model.OUT_CHANNELS`): the
-unary logit and the raw couplings, which `learned_potentials` turns into `mrf.Potentials` (the
-couplings through softplus, scaled by the settings' `coupling`; the unary shifted by
-`unary_shift`). So the network runs once per image, at session open, and a Generate is the
-inference alone.
+Its "features" are the network's four raw output channels per voxel (`model.OUT_CHANNELS`) with
+*no clicks*: the unary logit and the raw couplings of the automatic segmentation, made once per
+image at session open, in windows of the training patch size that overlap by half and are
+blended with Gaussian weights (`mrfseg.windows`). A Generate with points re-runs the network
+only in windows centred on the points, with the click maps as input (`learned.network_input`),
+and blends what it gives into a copy of those (`Learned.refine`): within a window the network
+decides what the clicks select and deselect; away from every point the automatic potentials
+stand. `learned_potentials` then turns the raw channels into `mrf.Potentials` (the couplings
+through softplus, scaled by the settings' `coupling`; the unary shifted by `unary_shift`).
 
 Takes the image in Hounsfield units (`input = "hu"`: `extract_features` leaves the HU grid as it
-is instead of min-max scaling it) at its training spacing (`native_spacing`), and runs the
-network in windows of the training patch size that overlap by half and are blended with
-Gaussian weights (`mrfseg.windows`). Within a window the output depends on the window's content
-only through each voxel's surroundings, so the windows agree where they overlap except for a
-rim at their edges, which the weights outvote.
+is instead of min-max scaling it) at its training spacing (`native_spacing`). Within a window
+the output depends on the window's content only through each voxel's surroundings, so the
+windows agree where they overlap except for a rim at their edges, which the weights outvote.
 
 The checkpoint is `$MRFSEG_LEARNED_WEIGHTS`, else `learned.pt` in the mrfseg cache
 (`$MRFSEG_CACHE`, default `~/.cache/mrfseg`); it is loaded once per process.
@@ -23,6 +25,7 @@ import math
 import os
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -30,10 +33,14 @@ import torch
 from ..compute import Progress
 from ..errors import InputError
 from ..features import FeatureVolume
+from ..grid import Grid
 from ..mrf import Potentials
 from ..windows import gaussian_weights, tile_starts
-from . import SPACING, normalize
+from . import SPACING, network_input
 from .model import OUT_CHANNELS, PotentialNet, load
+
+if TYPE_CHECKING:
+    from ..settings import MRFSettings
 
 _shared: dict[tuple[str, float], tuple[PotentialNet, dict]] = {}     # (resolved path, mtime) -> model
 _shared_lock = threading.Lock()
@@ -108,16 +115,55 @@ class Learned:
         return {"sweeps": int(args.get("sweeps", 20)), "coupling": 1.0, "unary_shift": 0.0}
 
     def __call__(self, volume: np.ndarray, device: torch.device, progress: Progress | None = None) -> np.ndarray:
-        """(4, z, y, x) float32 raw potentials of a (z, y, x) HU volume."""
-        model = self.model()
+        """(4, z, y, x) float32 raw potentials of a (z, y, x) HU volume, with no clicks: the
+        automatic segmentation's, in overlapping windows over the whole volume."""
         shape = volume.shape
         window = self.window
         step = max(1, round(window * (1 - self.overlap)))
         tiles = [tile_starts(n, window, step) for n in shape]
-        total = math.prod(len(t) for t in tiles)
+        origins = [(z, y, x) for z in tiles[0] for y in tiles[1] for x in tiles[2]]
         out = np.zeros((OUT_CHANNELS, *shape), dtype=np.float32)
         weight = np.zeros(shape, dtype=np.float32)
-        done = 0
+
+        def take(origin, size, result):
+            region = tuple(slice(o, o + s) for o, s in zip(origin, size))
+            w = gaussian_weights(size, self.sigma)
+            out[(slice(None), *region)] += result * w
+            weight[region] += w
+
+        self._run_windows(volume, None, origins, window, device, take, progress)
+        np.divide(out, weight, out=out)
+        return out
+
+    def refine(self, volume: np.ndarray, base: np.ndarray, clicks: np.ndarray, device: torch.device, progress: Progress | None = None) -> np.ndarray:
+        """`base` (4, z, y, x), the raw potentials with no clicks, re-made around the `clicks`
+        ((n, 4) rows of (z, y, x, label) on the volume's grid): the network runs in windows of
+        the training patch size centred on the clicks (one window covers the clicks within a
+        quarter window of its centre), with the click maps as input, and each window's output
+        replaces the base at its centre and fades into it toward its edges. A copy; `base` is
+        left alone."""
+        clicks = np.asarray(clicks, dtype=np.int64).reshape(-1, 4)
+        clicks = clicks[clicks[:, 3] != 0]
+        out = np.array(base, dtype=np.float32, copy=True)
+        if len(clicks) == 0:
+            return out
+        shape = volume.shape
+        window = self.window
+        origins = window_origins(clicks[:, :3], shape, window)
+
+        def take(origin, size, result):
+            region = tuple(slice(o, o + s) for o, s in zip(origin, size))
+            w = blend_weights(size)
+            out[(slice(None), *region)] += w * (result - out[(slice(None), *region)])
+
+        self._run_windows(volume, clicks, origins, window, device, take, progress)
+        return out
+
+    def _run_windows(self, volume, clicks, origins, window, device, take, progress) -> None:
+        """Run the network on the window of `window` voxels a side at each of `origins` (clipped
+        to the volume), with the `clicks` (or none) in the click maps, handing each result to
+        `take(origin, size, result)`."""
+        model = self.model()
         # A model given to the constructor (training, tests) runs where it is; the shared one is
         # moved to the device asked for, and back, so it is not left on a GPU between images.
         given = self._given is not None
@@ -126,28 +172,67 @@ class Learned:
             if not given:
                 model.to(device)
             try:
-                for z in tiles[0]:
-                    for y in tiles[1]:
-                        for x in tiles[2]:
-                            region = np.s_[z:z + window, y:y + window, x:x + window]
-                            block = normalize(np.asarray(volume[region], dtype=np.float32))
-                            result = model(torch.from_numpy(block)[None, None].to(run_on))[0].float().cpu().numpy()
-                            w = gaussian_weights(block.shape, self.sigma)
-                            out[(slice(None), *region)] += result * w
-                            weight[region] += w
-                            done += 1
-                            if progress:
-                                progress(done / total)
+                for done, origin in enumerate(origins, 1):
+                    size = tuple(min(window, n - o) for o, n in zip(origin, volume.shape))
+                    region = tuple(slice(o, o + s) for o, s in zip(origin, size))
+                    block = np.asarray(volume[region], dtype=np.float32)
+                    x = torch.from_numpy(network_input(block, clicks, origin))[None].to(run_on)
+                    result = model(x)[0].float().cpu().numpy()
+                    take(origin, size, result)
+                    if progress:
+                        progress(done / len(origins))
             finally:
                 if not given:
                     model.to("cpu")
-        np.divide(out, weight, out=out)
-        return out
 
 
-def learned_potentials(features: FeatureVolume, unary_shift: float, coupling_scale: float, device: torch.device) -> Potentials:
-    """`mrf.Potentials` from the network's raw output kept as features: see `PotentialNet.potentials`."""
+def window_origins(voxels: np.ndarray, shape: tuple[int, int, int], window: int) -> list[tuple[int, int, int]]:
+    """Where to start windows of `window` voxels a side so that each of `voxels` ((n, 3) in a
+    volume of `shape`) is within a quarter window of a window's centre -- as near the centre as
+    the volume's edges allow. Greedy: a voxel already that close to a window placed before gets
+    none of its own."""
+    origins: list[tuple[int, int, int]] = []
+    centres: list[np.ndarray] = []
+    upper = np.maximum(np.asarray(shape) - window, 0)
+    for voxel in np.asarray(voxels, dtype=np.int64).reshape(-1, 3):
+        if any((np.abs(voxel - centre) <= window // 4).all() for centre in centres):
+            continue
+        origin = np.clip(voxel - window // 2, 0, upper)
+        origins.append(tuple(int(o) for o in origin))
+        centres.append(origin + np.minimum(window, np.asarray(shape)) // 2)
+    return origins
+
+
+def blend_weights(size: tuple[int, int, int]) -> np.ndarray:
+    """How much a refined window replaces the base at each of its voxels: 1 within the inner
+    half of the window (where the clicks are), falling linearly to 0 at its faces."""
+    axes = []
+    for n in size:
+        x = np.abs(np.arange(n, dtype=np.float32) - (n - 1) / 2) / max(n / 2, 1)  # 0 at the middle, 1 at the faces
+        axes.append(np.clip(2 - 2 * x, 0, 1))
+    return axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
+
+
+def learned_potentials(
+    extractor: Learned,
+    features: FeatureVolume,
+    grid: Grid,
+    points: np.ndarray,
+    labels: np.ndarray,
+    settings: MRFSettings,
+    device: torch.device,
+    progress: Progress | None = None,
+) -> Potentials:
+    """`mrf.Potentials` from the network's raw output kept as features, re-made around the points
+    when there are any (`Learned.refine`): see `PotentialNet.potentials`."""
     if features.channels != OUT_CHANNELS:
         raise InputError(f"The learned potentials need {OUT_CHANNELS} feature channels, not {features.channels}")
-    raw = torch.from_numpy(np.asarray(features.values, dtype=np.float32)).to(device)
-    return PotentialNet.potentials(raw, unary_shift, coupling_scale)
+    raw = np.asarray(features.values, dtype=np.float32)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if len(points):
+        if features.intensity is None:
+            raise InputError("The features carry no intensity grid to re-run the network on")
+        voxels = features.ct_to_feature_index(grid.world_to_index(points))
+        clicks = np.hstack([voxels, np.asarray(labels, dtype=np.int64).reshape(-1, 1)])
+        raw = extractor.refine(np.asarray(features.intensity, dtype=np.float32), raw, clicks, device, progress)
+    return PotentialNet.potentials(torch.from_numpy(raw).to(device), settings.unary_shift, settings.coupling)

@@ -39,6 +39,9 @@ class InferenceSummary:
     delta: float
     """The largest change of any marginal in the last sweep."""
     converged: bool
+    components: int | None = None
+    """How many connected components the inside points kept (`MRFSettings.connected`); None
+    when nothing was dropped: the rule is off, or there were no inside points."""
 
 
 @dataclass(frozen=True)
@@ -52,8 +55,6 @@ class Segmentation:
     coupling: vtkImageData
     """The mean coupling of the edges at each voxel: high where a label change is expensive."""
     inference: InferenceSummary
-    seeds: np.ndarray
-    """(k, 3) int64: the CT voxel (i, j, k) of each inside point, for the labelmap's connectivity."""
     seconds: dict[str, float] = field(default_factory=dict)
     """How long each step took: features (0 when they were already there), potentials, inference, maps."""
 
@@ -204,13 +205,13 @@ class MRFSegmentation:
         report("inference")
         started = time.perf_counter()
         result = mean_field(potentials, clamps, self.settings.sweeps, progress)
+        components = select_connected(result.marginal, clamps) if self.settings.connected else None
         seconds["inference"] = time.perf_counter() - started
 
         report("maps")
         started = time.perf_counter()
         self.last_segmentation = None  # its memory is free for the new maps
-        seeds = np.rint(grid.world_to_index(points[labels > 0])).astype(np.int64) if (labels > 0).any() else np.zeros((0, 3), dtype=np.int64)
-        segmentation = self._maps(volume, potentials, result, seeds, progress)
+        segmentation = self._maps(volume, potentials, result, components, progress)
         seconds["maps"] = time.perf_counter() - started
         self.last_segmentation = replace(segmentation, seconds=seconds)
         return self.last_segmentation
@@ -220,11 +221,12 @@ class MRFSegmentation:
         the constructor, the maker given with it, or the handcrafted ones."""
         if self._given_extractor is not None:
             if self._given_potentials is not None:
-                return self._given_potentials(features, grid, points, labels, self.settings, device, progress)
+                return self._given_potentials(self._given_extractor, features, grid, points, labels, self.settings, device, progress)
             from .handcrafted import handcrafted_potentials
 
             return handcrafted_potentials(features, grid, points, labels, self.settings.handcrafted, device, progress)
-        return extractor_spec(self.settings.feature_extractor).potentials(features, grid, points, labels, self.settings, device, progress)
+        spec = extractor_spec(self.settings.feature_extractor)
+        return spec.potentials(self.feature_extractor(), features, grid, points, labels, self.settings, device, progress)
 
     def extract_surface(self, source: str = "probability", level: float | None = None) -> vtkPolyData:
         """A triangle mesh of the last segmentation's boundary: the probability's `level` set
@@ -238,19 +240,17 @@ class MRFSegmentation:
             return extract_surface(segmentation.unary, 0.0 if level is None else level)
         raise InputError(f"Unknown surface source {source!r}: 'probability' or 'unary'")
 
-    def labelmap(self, threshold: float = 0.5, connected: bool = False) -> vtkImageData:
+    def labelmap(self, threshold: float = 0.5) -> vtkImageData:
         """The last segmentation's voxels with p(y = 1) >= `threshold`, as a uint8 image on the
-        reference grid: 1 inside, 0 outside. With `connected`, only the face-connected
-        components holding an inside point are kept (the largest one, when there were no inside
-        points): the CRF cannot promise connectivity, so this is where islands go."""
+        reference grid: 1 inside, 0 outside. Connectivity to the inside points is the
+        probability's own business (`MRFSettings.connected`), so the labelmap and the surface
+        at one threshold agree."""
         segmentation = self._require_segmentation()
         level = _probability_level(threshold)
         image, labels = image_like(segmentation.probability, "label", np.uint8)
         probability = voxels(segmentation.probability)
         for k in range(len(labels)):  # a slice at a time: no float volume the size of the CT
             labels[k] = probability[k] >= level
-        if connected:
-            _keep_connected(labels, segmentation.seeds)
         return image
 
     def __repr__(self) -> str:
@@ -268,7 +268,7 @@ class MRFSegmentation:
             raise InputError("No segmentation yet: generate one first")
         return self.last_segmentation
 
-    def _maps(self, volume: vtkImageData, potentials: Potentials, result: MeanFieldResult, seeds: np.ndarray, progress: Progress | None) -> Segmentation:
+    def _maps(self, volume: vtkImageData, potentials: Potentials, result: MeanFieldResult, components: int | None, progress: Progress | None) -> Segmentation:
         """The marginal, the unary and the mean coupling read onto the CT's grid, a slice at a time."""
         dims = volume.GetDimensions()
         probability_image, probability = image_like(volume, "probability")
@@ -282,8 +282,8 @@ class MRFSegmentation:
                 targets[name][k] = resample_to(source, dims, k).cpu().numpy()
             if progress:
                 progress((k + 1) / nz)
-        inference = InferenceSummary(result.sweeps, result.delta, result.converged)
-        return Segmentation(probability_image, unary_image, coupling_image, inference, seeds)
+        inference = InferenceSummary(result.sweeps, result.delta, result.converged, components)
+        return Segmentation(probability_image, unary_image, coupling_image, inference)
 
 
 def check_grids(ct_dims: tuple[int, int, int], ct_spacing: tuple[float, float, float], spacing: float, channels: int) -> None:
@@ -316,23 +316,21 @@ def _probability_level(threshold: float) -> float:
     return float(threshold)
 
 
-def _keep_connected(labels: np.ndarray, seeds: np.ndarray) -> None:
-    """In place: of the face-connected components of `labels` (z, y, x), keep those holding a
-    seed ((k, 3) CT indices (i, j, k)), or the largest if there are no seeds."""
+def select_connected(marginal: torch.Tensor, clamps: Clamps) -> int | None:
+    """In place: of the face-connected components of {marginal >= 0.5} on the grid, keep those
+    that hold an inside clamp and set the marginal to 0 on the others; voxels below 0.5 are left
+    as they are. The number kept; None, and nothing changed, without inside clamps."""
+    inside = clamps.inside()
+    if len(inside) == 0:
+        return None
+    labels = (marginal >= 0.5).cpu().numpy()
     components, count = ndimage.label(labels, structure=SIX)
-    if count <= 1:
-        return
-    keep = np.zeros(0, dtype=np.int64)
-    if len(seeds):
-        nz, ny, nx = labels.shape
-        seeds = np.clip(seeds, 0, [nx - 1, ny - 1, nz - 1])
-        keep = np.unique(components[seeds[:, 2], seeds[:, 1], seeds[:, 0]])
-        keep = keep[keep > 0]
-    if len(keep) == 0:  # no seeds, or none on a labelled voxel: the largest component
-        sizes = np.bincount(components.ravel())
-        sizes[0] = 0
-        keep = np.array([int(sizes.argmax())])
-    wanted = np.zeros(count + 1, dtype=bool)
-    wanted[keep] = True
-    for k in range(len(labels)):
-        labels[k] = wanted[components[k]]
+    seeds = inside.cpu().numpy()
+    keep = np.unique(components[seeds[:, 0], seeds[:, 1], seeds[:, 2]])
+    keep = keep[keep > 0]
+    dropped = np.ones(count + 1, dtype=bool)
+    dropped[0] = False  # below the threshold: not a component
+    dropped[keep] = False
+    mask = torch.from_numpy(dropped[components]).to(marginal.device)
+    marginal.masked_fill_(mask, 0.0)
+    return int(len(keep))

@@ -30,7 +30,7 @@ import argparse
 import csv
 import json
 import math
-import sys
+import os
 import time
 from pathlib import Path
 
@@ -198,7 +198,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--val-cube", type=int, default=96)
     ap.add_argument("--val-clicks", type=int, default=5)
     ap.add_argument("--train-cases", type=int, default=None, help="use only this many training scans (smoke tests)")
-    ap.add_argument("--resume", action="store_true", help="carry on from --out/last.pt")
+    ap.add_argument("--resume", action="store_true", help="carry on from --out/last.pt: the network, the optimiser, the step, the best score")
+    ap.add_argument("--init", default=None, help="start a new run from this checkpoint's weights (a fresh optimiser and schedule)")
+    ap.add_argument("--checkpoint-every", type=int, default=None, help="steps between saves of last.pt (default: --val-every)")
     ap.add_argument("--time-limit", type=float, default=None, help="minutes: end this piece after that long, validating and saving")
     ap.add_argument("--stop-after", type=int, default=None, help="end this piece after this many steps")
     ap.add_argument("--seed", type=int, default=0)
@@ -219,12 +221,24 @@ def main(argv: list[str] | None = None) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp == torch.float16)
     step, best = 0, -math.inf
-    if args.resume and (out / "last.pt").is_file():
+    if args.resume:
+        if not (out / "last.pt").is_file():
+            raise SystemExit(f"--resume: no {out / 'last.pt'} to carry on from")
         blob = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+        for name in ("patch", "sweeps", "base", "levels", "norm", "steps"):
+            if blob.get("args", {}).get(name) != getattr(args, name):
+                print(f"warning: --{name} is {getattr(args, name)}, but the run being resumed used {blob.get('args', {}).get(name)}", flush=True)
         model.load_state_dict(blob["state"])
         optimizer.load_state_dict(blob["optimizer"])
+        if "scaler" in blob:
+            scaler.load_state_dict(blob["scaler"])
         step, best = int(blob["step"]), float(blob.get("best", -math.inf))
-        print(f"resumed at step {step} (best {best:.3f})", flush=True)
+        print(f"resumed {out / 'last.pt'} at step {step} (best {best:.3f})", flush=True)
+    elif args.init:
+        blob = torch.load(args.init, map_location="cpu", weights_only=False)
+        model.load_state_dict(blob["state"])
+        print(f"initialised from {args.init} (step {blob.get('step', '?')} of its run)", flush=True)
+    checkpoint_every = args.checkpoint_every or args.val_every
 
     def autocast():
         return torch.autocast(device.type, dtype=amp) if amp else torch.autocast(device.type, enabled=False)
@@ -249,7 +263,14 @@ def main(argv: list[str] | None = None) -> None:
           f"({ {torch.bfloat16: 'bf16', torch.float16: 'fp16 + loss scaling', None: 'fp32'}[amp] })", flush=True)
 
     def checkpoint(name: str, **more) -> None:
-        save(model, str(out / name), step=step, best=best, **extra, **more)
+        """Written to a temporary file first and renamed into place, so a crash while saving
+        leaves the previous checkpoint whole."""
+        path = out / name
+        save(model, str(path.with_suffix(".pt.tmp")), step=step, best=best, **extra, **more)
+        os.replace(path.with_suffix(".pt.tmp"), path)
+
+    def save_last() -> None:
+        checkpoint("last.pt", optimizer=optimizer.state_dict(), scaler=scaler.state_dict())
 
     def validate() -> dict:
         v_loss, v_stats = validation_loss(model, val_loader, device, args.sweeps, autocast)
@@ -290,6 +311,8 @@ def main(argv: list[str] | None = None) -> None:
 
             out_of_time = args.time_limit is not None and (time.perf_counter() - started) / 60 >= args.time_limit
             last = step >= stop_at or out_of_time
+            if step % checkpoint_every == 0 and not last:
+                save_last()
             if step % args.log_every == 0 or last:
                 n = max(count, 1)
                 row = {k: v / n for k, v in running.items()}
@@ -305,7 +328,7 @@ def main(argv: list[str] | None = None) -> None:
                               time.perf_counter() - started])
                 log_file.flush()
             if last:
-                checkpoint("last.pt", optimizer=optimizer.state_dict())
+                save_last()
                 done = True
                 break
     log_file.close()

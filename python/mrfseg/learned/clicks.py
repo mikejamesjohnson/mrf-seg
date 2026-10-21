@@ -68,31 +68,64 @@ def clicks_to_reach(dices: list[float], level: float) -> int:
     return int(reached[0]) + 1 if reached.size else len(dices) + 1
 
 
+#: The connectivity a click's structure is taken in: 26 neighbours, so a vessel one voxel thick
+#: that steps diagonally is still one structure.
+STRUCTURE = np.ones((3, 3, 3), dtype=bool)
+
+
 def random_clicks(lumen: np.ndarray, rng: np.random.Generator, n_inside: int, n_outside: int, spacing: float,
-                  near_wall: float = 2.0, near_share: float = 2 / 3, margin: int = 0) -> np.ndarray:
+                  near_wall: float = 2.0, near_share: float = 2 / 3, margin: int = 0, on_lumen_share: float = 0.3) -> np.ndarray:
     """Clicks for training, (n, 4) rows of (z, y, x, label): `n_inside` in the `lumen` (binary
     (z, y, x)), spread over its connected components in turn so a small branch gets its share,
-    and `n_outside` outside it, `near_share` of them within `near_wall` mm of the lumen, where a
-    user's outside clicks go. All keep `margin` voxels from the volume's faces. Fewer when there
-    is no room (no lumen: no inside clicks)."""
+    and `n_outside` outside it -- `on_lumen_share` of those on a lumen component that got no
+    inside click, where a user clicks to drop a vessel that is not wanted, and of the rest
+    `near_share` within `near_wall` mm of the lumen, where a user's outside clicks go. All keep
+    `margin` voxels from the volume's faces. Fewer when there is no room (no lumen: no inside
+    clicks)."""
     s = np.array(lumen.shape)
     inner = np.zeros_like(lumen)
     inner[tuple(slice(margin, n - margin) for n in s)] = True
     rows: list[tuple[int, int, int, int]] = []
+    components, count = ndimage.label(lumen, structure=STRUCTURE) if lumen.any() else (np.zeros_like(lumen, dtype=np.int32), 0)
+    clicked: set[int] = set()
     if n_inside and (lumen & inner).any():
-        components, count = ndimage.label(lumen, structure=np.ones((3, 3, 3)))
-        pools = [np.argwhere((components == c) & inner) for c in range(1, count + 1)]
-        pools = sorted([p for p in pools if len(p)], key=len, reverse=True)
+        pools = [(c, np.argwhere((components == c) & inner)) for c in range(1, count + 1)]
+        pools = sorted([p for p in pools if len(p[1])], key=lambda p: len(p[1]), reverse=True)
         for k in range(n_inside):
-            pool = pools[k % len(pools)]
+            c, pool = pools[k % len(pools)]
             z, y, x = pool[rng.integers(len(pool))]
             rows.append((int(z), int(y), int(x), 1))
+            clicked.add(c)
     outside = ~lumen & inner
     if n_outside and outside.any():
         near = outside & (ndimage.distance_transform_edt(~lumen, sampling=spacing) <= near_wall) if lumen.any() else np.zeros_like(lumen)
         near_voxels, any_voxels = np.argwhere(near), np.argwhere(outside)
+        unwanted = np.argwhere(lumen & inner & ~np.isin(components, list(clicked))) if count > len(clicked) else np.zeros((0, 3), dtype=np.int64)
         for _ in range(n_outside):
-            pool = near_voxels if len(near_voxels) and rng.random() < near_share else any_voxels
+            if len(unwanted) and rng.random() < on_lumen_share:
+                pool = unwanted
+            else:
+                pool = near_voxels if len(near_voxels) and rng.random() < near_share else any_voxels
             z, y, x = pool[rng.integers(len(pool))]
             rows.append((int(z), int(y), int(x), -1))
     return np.array(rows, dtype=np.int64).reshape(-1, 4)
+
+
+def conditioned_target(lumen: np.ndarray, clicks: np.ndarray) -> np.ndarray:
+    """What the segmentation should be given the clicks: with inside clicks, the connected
+    components of `lumen` (binary (z, y, x)) that hold one; without, all of it; less any
+    component that holds an outside click and no inside click. (n, 4) `clicks` as `random_clicks`
+    gives them, label 0 being padding."""
+    clicks = np.asarray(clicks).reshape(-1, 4)
+    clicks = clicks[clicks[:, 3] != 0]
+    if len(clicks) == 0 or not lumen.any():
+        return lumen.copy()
+    components, count = ndimage.label(lumen, structure=STRUCTURE)
+    at = components[clicks[:, 0], clicks[:, 1], clicks[:, 2]]
+    inside = set(int(c) for c in at[clicks[:, 3] > 0] if c > 0)
+    outside = set(int(c) for c in at[clicks[:, 3] < 0] if c > 0) - inside
+    if inside:
+        keep = inside
+    else:
+        keep = set(range(1, count + 1)) - outside
+    return np.isin(components, list(keep)) if keep else np.zeros_like(lumen)

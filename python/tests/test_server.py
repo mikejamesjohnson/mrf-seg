@@ -121,7 +121,7 @@ class ServerTest(unittest.TestCase):
         result = job["result"]
         self.assertEqual(result["points"], 10)
         self.assertEqual(set(result["maps"]), {"unary", "coupling", "probability"})
-        self.assertEqual(set(result["inference"]), {"sweeps", "delta", "converged"})
+        self.assertEqual(set(result["inference"]), {"sweeps", "delta", "converged", "components"})
         self.assertEqual(set(result["seconds"]), {"features", "potentials", "inference", "maps"})
 
         points, labels = self.points()
@@ -221,12 +221,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(labels.size, 24 * 22 * 18)
         self.assertEqual(set(np.unique(labels)), {0, 1})
         self.assertEqual(int(labels.sum()), summary["voxels"])
-        self.assertEqual(summary["connected"], False)
-        status, _, data = self.call("POST", f"/sessions/{session}/labelmap", {"threshold": 0.5, "connected": True})
-        self.assertEqual(status, 200, data)
-        self.assertEqual(json.loads(data)["connected"], True)
-        self.assertLessEqual(json.loads(data)["voxels"], summary["voxels"])
-        for bad in ({"threshold": 1.5}, {"threshold": "half"}, {"threshold": True}, {"connected": "yes"}):
+        for bad in ({"threshold": 1.5}, {"threshold": "half"}, {"threshold": True}):
             with self.subTest(bad):
                 self.assertEqual(self.call("POST", f"/sessions/{session}/labelmap", bad)[0], 400)
 

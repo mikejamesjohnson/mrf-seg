@@ -39,7 +39,7 @@ WHOLE = ("basic_scales", "sweeps")
 #: The settings that None leaves to the image, chosen from its grid (`MRFSettings.resolved_for`).
 IMAGE_DERIVED = ("feature_spacing", "spatial_lengthscale")
 #: The settings that are true or false.
-FLAGS = ("basic_edges", "basic_shape")
+FLAGS = ("basic_edges", "basic_shape", "connected")
 DEVICES = ("auto", "cpu")
 
 
@@ -99,6 +99,12 @@ class MRFSettings:
     """Mean-field sweeps (each updates both parities of the checkerboard). Information travels one
     voxel per half-sweep, so this bounds how far a click reaches through the coupling. Stops
     early once a sweep changes no marginal by more than 0.001."""
+    connected: bool = True
+    """Keep only the lumen the inside points connect to: after the sweeps, of the face-connected
+    components of {p >= 0.5}, those that hold an inside point stay and the probability is set to
+    0 on the others, so an inside point reaches as far as the vessel it is in reaches, and no
+    further. With no inside points, everything stays. The labelmap and the surface follow the
+    probability."""
 
     def __post_init__(self) -> None:
         for name, (low, high) in BOUNDS.items():

@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.model:
         model, extra = load(args.model, "cpu")
         extractor = Learned(model, extra)
-        settings = MRFSettings(feature_extractor="basic", device=args.device, **extractor.setting_defaults)
+        settings = MRFSettings(device=args.device, **extractor.setting_defaults)
         print(f"learned ({args.model}):", extractor.setting_defaults, flush=True)
         metrics["learned"] = evaluate(cubes, settings, args.clicks, extractor, EXTRACTORS["learned"].potentials, log=lambda s: print(s, flush=True))
         print(json.dumps(metrics["learned"], indent=1), flush=True)

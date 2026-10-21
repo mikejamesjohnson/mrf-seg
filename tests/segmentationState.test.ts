@@ -9,7 +9,7 @@ import { freshStorePerTest, openImage } from "./helpers";
 freshStorePerTest();
 const store = () => useSceneStore.getState();
 
-const inference = { sweeps: 10, delta: 0.0001, converged: true };
+const inference = { sweeps: 10, delta: 0.0001, converged: true, components: 1 };
 
 /** The store with an image, an inside and an outside point, a session, and a segmentation generated from all of that. */
 function generated(): GeneratedSegmentation {
@@ -67,7 +67,7 @@ describe("the segmentation state", () => {
     store().setPlaceMode("outside");
     store().addPoint([5, 5, 5]);
     expect(staleReasons(store())).toEqual(["the points have changed"]);
-    store().setSegmentationSettings({ sweeps: 7 });
+    store().setSegmentationSettings({ connected: false });
     store().setSegmentation({ sessionId: "s2" });
     expect(staleReasons(store())).toEqual(["the points have changed", "the settings have changed", "the backend session is new, and has no segmentation yet"]);
     expect(segmentationIsStale(store())).toBe(true);
@@ -126,14 +126,12 @@ describe("the segmentation state", () => {
   it("knows a product is out of date by generation and by its own settings", () => {
     generated();
     expect(productStale(store(), "labelmap")).toBe(true); // never built
-    store().setProduct("labelmap", { built: { threshold: 0.5, connected: true, voxels: 1, seconds: 0, generation: 1 } });
+    store().setProduct("labelmap", { built: { threshold: 0.5, voxels: 1, seconds: 0, generation: 1 } });
     store().setProduct("surface", { built: { source: "probability", level: 0.5, triangles: 1, seconds: 0, generation: 1 } });
     expect([productStale(store(), "labelmap"), productStale(store(), "surface")]).toEqual([false, false]);
     store().setProduct("labelmap", { threshold: 0.6 });
     expect(productStale(store(), "labelmap")).toBe(true);
-    store().setProduct("labelmap", { threshold: 0.5, connected: false });
-    expect(productStale(store(), "labelmap")).toBe(true);
-    store().setProduct("labelmap", { connected: true });
+    store().setProduct("labelmap", { threshold: 0.5 });
     store().setProduct("surface", { source: "unary" });
     expect(productStale(store(), "surface")).toBe(true);
     store().setProduct("surface", { source: "probability" });

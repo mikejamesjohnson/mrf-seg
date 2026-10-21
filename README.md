@@ -15,8 +15,9 @@ The potentials come from one of two places:
   contrast-sensitive coupling in Hounsfield units. This is what to start with.
 - **Learned** (after training): a 3D U-Net whose four output channels per voxel *are* the
   potentials, trained from scratch on coronary CTA with coronary label maps through the same
-  mean-field inference the editor runs. It needs its checkpoint; see
-  [Training the network](#training-the-network).
+  mean-field inference the editor runs. It sees your points: an inside point selects the vessel
+  it is in, an outside point drops the structure it is in, and with no points it segments every
+  coronary. It needs its checkpoint; see [Training the network](#training-the-network).
 
 The setup follows `pseg3d` (the Gaussian process editor this grew out of): Next.js + React +
 Tailwind/shadcn for the interface, vtk.js for rendering, Zustand for state. The segmentation
@@ -78,11 +79,15 @@ away, and the panel shows the progress. The side panel follows the model: **Imag
 extraction**, **Unary potential**, **Pairwise potential**, **Inference**, **Points**, **Generate**.
 
 1. **Points.** Choose **Inside** (key **2**) or **Outside** (key **3**) and click in any slice
-   view; **Navigate** (key **1**) turns placing off. Basic needs at least one inside point;
+   view; **Navigate** (key **1**) turns placing off. An inside point goes in the lumen of a vessel
+   you want; an outside point on something you do not. Basic needs at least one inside point;
    Learned needs none. Points can be dragged, selected and removed as in pseg3d (see the Points
    section of the panel).
-2. **Generate segmentation.** Builds the potentials from the features and the points, clamps the
-   points to their labels, runs the mean-field sweeps, and draws three maps over the image:
+2. **Generate segmentation.** Builds the potentials from the features and the points (Learned
+   re-runs the network in windows around the points), clamps the points to their labels, runs
+   the mean-field sweeps, keeps the lumen the inside points connect to (**Connected**, in the
+   Inference section: an inside point reaches as far as its vessel reaches, and unclicked vessels
+   drop out), and draws three maps over the image:
 
    | Map             | What it is                                                            | Drawn as                          |
    | --------------- | --------------------------------------------------------------------- | --------------------------------- |
@@ -93,9 +98,7 @@ extraction**, **Unary potential**, **Pairwise potential**, **Inference**, **Poin
    Each map can be shown, hidden, faded and sampled (trilinear or nearest) on its own. The
    Inference section says how many sweeps it took and whether it converged.
 3. **Generate labelmap.** 1 for every voxel with probability at least **Threshold p** (0.5), 0
-   elsewhere. **Connected to the inside points** (on by default) keeps only the connected
-   components an inside point touches: a pairwise CRF cannot promise one connected vessel tree,
-   so islands of lumen-like voxels are labelled too, and this is where they go.
+   elsewhere.
 4. **Generate surface.** Marching cubes on the probability at the threshold, or on the unary
    logit's zero level (the evidence alone). Drawn in 3D and as an outline on the slices.
 
@@ -120,6 +123,7 @@ pipeline's order, and a stale segmentation is never built from.
 | Pairwise potential | δ, contrast HU          | 100 (Basic)                                            | An edge with this HU step keeps 61 % of the coupling                                     |
 | Pairwise potential | Floor                   | 0.1 (Basic)                                            | The share of the coupling every edge keeps                                               |
 | Inference          | Sweeps                  | 50 (Learned: as trained)                               | Mean-field sweeps; stops early once nothing changes by more than 0.001                   |
+| Inference          | Connected               | on                                                     | Keep only the lumen the inside points connect to through p ≥ 0.5; p is 0 on the rest     |
 
 Coarser spacing is faster: the inference's time and memory go with the number of voxels (a
 512 × 512 × 300 scan at 0.5 mm is about 40 M voxels and takes a few seconds on an Apple GPU,
@@ -137,9 +141,10 @@ cd python
 ```
 
 It reports the mean Dice after 1, 3, 5 and 10 clicks, the clicks it took to reach Dice 0.85
-and 0.90, and the leak into other vessels. With the Basic defaults on 8 test cubes of 96³ at
-0.5 mm the Dice was 0.42 / 0.53 / 0.58 after 1 / 3 / 5 clicks with no leak: the handcrafted
-potentials are precise but short of recall, which is what the network is for.
+and 0.90, and the leak into other vessels (the target of a cube is the vessel connected to the
+first click, which is what the points are meant to select). With the Basic defaults on 8 test
+cubes of 96³ at 0.5 mm the Dice was 0.40 / 0.52 / 0.58 after 1 / 3 / 5 clicks with no leak: the
+handcrafted potentials are precise but short of recall, which is what the network is for.
 
 ## Training the network
 
@@ -167,21 +172,30 @@ npm run dev
 ```
 
 `train` draws 96³ patches centred near vessels, simulates a user's clicks on each (none to 3
-inside, none to 4 outside, mostly near the wall), runs the network, then 20 mean-field sweeps
-*through which the loss is back-propagated*, and scores the marginals against the lumen label
-with cross-entropy plus a soft Dice; a lighter cross-entropy on the unary alone keeps it a
-usable classifier by itself. It prints the loss and the Dice on the training patches, validates
-every 2000 steps with a simulated user on sub-volumes of validation scans (Dice with 0 / 1 / 3 /
-5 clicks, and the leak into other vessels), and keeps `best.pt` (by that Dice) and `last.pt`
-(with the optimiser). The checkpoint records the settings the editor should start from with it
-(the sweeps it was trained through). On CUDA it runs in bf16 (Ampere and later) or fp16 with
-loss scaling; a Mac's GPU works too, slowly (`--device mps`). Checkpoints, logs and runs are
-ignored by git (`runs/`, `*.pt`).
+inside, none to 4 outside -- some on a vessel that got no inside click), gives the network the
+image and two click maps as input, conditions the target on the clicks (the lumen connected to
+the inside clicks; everything with none; less a vessel with an outside click and no inside one),
+runs 20 mean-field sweeps *through which the loss is back-propagated*, and scores the marginals
+against the target with cross-entropy plus a soft Dice; a lighter cross-entropy on the unary
+alone keeps it a usable classifier by itself. It prints the loss and the Dice on the training
+patches and validates every 2000 steps with a simulated user on sub-volumes of validation scans
+(Dice with 0 / 1 / 3 / 5 clicks, and the leak into other vessels).
+
+Checkpoints: `best.pt` is the network with the best validation Dice (what the editor loads);
+`last.pt` is the whole state of the run -- network, optimiser, loss scaler, step, best score --
+written at every validation (`--checkpoint-every` to change) and whenever a piece ends, with an
+atomic rename, so a crash loses at most 2000 steps. `./train.sh full` resumes from `last.pt` by
+itself when there is one (`--resume`); `--init best.pt` starts a fresh run from a checkpoint's
+weights instead. Checkpoints, logs and runs are ignored by git (`runs/`, `*.pt`). The
+checkpoint records the settings the editor should start from with it (the sweeps it was trained
+through). On CUDA the network runs in bf16 (Ampere and later) or fp16 with loss scaling; a
+Mac's GPU works too, slowly (`--device mps`).
 
 Once `MRFSEG_LEARNED_WEIGHTS` points at a checkpoint (or it sits at `~/.cache/mrfseg/learned.pt`),
 the editor offers **Learned** and chooses it by default. Its features are the network's raw
-potentials, extracted once per image in overlapping 96³ windows; a Generate is then the
-inference alone, and the points only clamp.
+potentials with no points, extracted once per image in overlapping 96³ windows; a Generate
+re-runs the network in windows centred on the points, with the click maps as input, blends the
+result into those, and infers.
 
 `npm run backend` runs the backend on its own (`python -m mrfseg.server`, port 8004), for
 working on it.

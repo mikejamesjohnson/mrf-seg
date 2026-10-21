@@ -51,25 +51,24 @@ async function build<K extends ProductKey>(
   }
 }
 
-/** The labelmap at the panel's threshold (connected to the inside points, if asked): uint8 on the image's grid, drawn over it. */
+/** The labelmap at the panel's threshold: uint8 on the image's grid, drawn over it. */
 export function buildSegmentationLabelmap(): Promise<void> {
-  const { threshold, connected } = store().labelmap;
+  const { threshold } = store().labelmap;
   return build("labelmap", "Building labelmap…", async (sessionId, image) => {
-    const summary = await buildLabelmap(sessionId, threshold, connected);
+    const summary = await buildLabelmap(sessionId, threshold);
     const labels = await fetchLabelmap(sessionId, voxelCount(image));
     const dataset: LabelmapDataset = {
       ...onGridOf(image, "labelmap"),
       kind: "labelmap",
       label: "Labelmap",
       threshold,
-      connected,
       voxels: summary.voxels,
       arrayName: "label",
       scalarType: "Uint8Array",
       scalarRange: [0, 1],
     };
     return {
-      built: { threshold, connected, voxels: summary.voxels, seconds: summary.seconds },
+      built: { threshold, voxels: summary.voxels, seconds: summary.seconds },
       commit: () => store().putMap(dataset, imageOnGrid(image, "label", labels), {}),
     };
   });
@@ -119,7 +118,7 @@ export const PRODUCTS: readonly ProductSpec[] = [
     label: "Build labelmap",
     build: buildSegmentationLabelmap,
     stale: (state) => productStale(state, "labelmap"),
-    inputs: (state) => [state.labelmap.threshold, state.labelmap.connected],
+    inputs: (state) => [state.labelmap.threshold],
   },
   {
     key: "surface",

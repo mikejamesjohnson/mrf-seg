@@ -14,8 +14,9 @@ Two so far:
   unaries from the clicks and contrast-sensitive couplings (`handcrafted.py`). Needs at least
   one inside click.
 - **learned**: our own network, trained on coronary CTA (`learned/`), whose four output
-  channels *are* the potentials: a unary logit and three couplings per voxel. The clicks only
-  clamp. Needs its checkpoint (`learned/extractor.py`).
+  channels *are* the potentials: a unary logit and three couplings per voxel. It sees the
+  clicks, and is re-run around them at every Generate (`learned/extractor.py`). Needs its
+  checkpoint.
 """
 
 from __future__ import annotations
@@ -39,8 +40,8 @@ from .mrf import Potentials
 if TYPE_CHECKING:
     from .settings import MRFSettings
 
-#: features, grid, points (n, 3) mm, labels (n,) +1 / -1, settings, device, progress -> the potentials.
-PotentialsMaker = Callable[[FeatureVolume, Grid, np.ndarray, np.ndarray, "MRFSettings", torch.device, "Progress | None"], Potentials]
+#: extractor, features, grid, points (n, 3) mm, labels (n,) +1 / -1, settings, device, progress -> the potentials.
+PotentialsMaker = Callable[[FeatureExtractor, FeatureVolume, Grid, np.ndarray, np.ndarray, "MRFSettings", torch.device, "Progress | None"], Potentials]
 
 
 @dataclass(frozen=True)
@@ -61,16 +62,18 @@ class ExtractorSpec:
     no settings of its own."""
 
 
-def _handcrafted(features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray, settings: MRFSettings,
-                 device: torch.device, progress: Progress | None) -> Potentials:
+def _handcrafted(extractor: FeatureExtractor, features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray,
+                 settings: MRFSettings, device: torch.device, progress: Progress | None) -> Potentials:
     from .handcrafted import handcrafted_potentials
 
     return handcrafted_potentials(features, grid, points, labels, settings.handcrafted, device, progress)
 
 
-def _learned(features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray, settings: MRFSettings,
-             device: torch.device, progress: Progress | None) -> Potentials:
-    return learned_potentials(features, settings.unary_shift, settings.coupling, device)
+def _learned(extractor: FeatureExtractor, features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray,
+             settings: MRFSettings, device: torch.device, progress: Progress | None) -> Potentials:
+    if not isinstance(extractor, Learned):
+        raise InputError("The learned potentials need the Learned extractor")
+    return learned_potentials(extractor, features, grid, points, labels, settings, device, progress)
 
 
 def _describe_learned() -> dict:

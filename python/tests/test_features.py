@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter
 from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonDataModel import vtkImageData
 
-from mrfseg.learned import normalize
+from mrfseg.learned import IN_CHANNELS, network_input
 from mrfseg.learned.extractor import Learned
 from mrfseg.learned.model import OUT_CHANNELS
 from mrfseg.basic import Basic
@@ -156,7 +156,7 @@ class PointwiseModel(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.conv = torch.nn.Conv3d(1, OUT_CHANNELS, 1)
+        self.conv = torch.nn.Conv3d(IN_CHANNELS, OUT_CHANNELS, 1)
 
     def forward(self, x):
         return self.conv(x)
@@ -174,7 +174,7 @@ class WindowingTest(unittest.TestCase):
         steps = []
         windowed = extractor(volume, CPU, steps.append)
         with torch.no_grad():
-            whole = extractor.model()(torch.from_numpy(normalize(volume))[None, None])[0].numpy()
+            whole = extractor.model()(torch.from_numpy(network_input(volume))[None])[0].numpy()
         np.testing.assert_allclose(windowed, whole, atol=1e-5)
         self.assertEqual(len(steps), 2 * 4 * 3)  # windows of 32 every 16 voxels
         self.assertEqual(steps[-1], 1.0)
@@ -184,20 +184,20 @@ class WindowingTest(unittest.TestCase):
         volume = np.random.default_rng(4).random((20, 45, 33), dtype=np.float32)  # 20 < 32, none a multiple of 16
         windowed = extractor(volume, CPU)
         with torch.no_grad():
-            whole = extractor.model()(torch.from_numpy(normalize(volume))[None, None])[0].numpy()
+            whole = extractor.model()(torch.from_numpy(network_input(volume))[None])[0].numpy()
         self.assertEqual(windowed.shape, (OUT_CHANNELS, 20, 45, 33))
         np.testing.assert_allclose(windowed, whole, atol=1e-5)
 
     def test_a_volume_that_fits_a_window_is_one_pass(self):
         # A model that sees its neighbours: in windows it would differ near their edges. A volume
         # that fits one window is run whole, as it is (the network pads itself to its stride).
-        model = torch.nn.Sequential(torch.nn.Conv3d(1, 8, 3, padding=1, padding_mode="reflect"), torch.nn.ReLU(), torch.nn.Conv3d(8, OUT_CHANNELS, 3, padding=1))
+        model = torch.nn.Sequential(torch.nn.Conv3d(IN_CHANNELS, 8, 3, padding=1, padding_mode="reflect"), torch.nn.ReLU(), torch.nn.Conv3d(8, OUT_CHANNELS, 3, padding=1))
         extractor = self.extractor(model, window=48)
         volume = np.random.default_rng(6).random((40, 45, 33), dtype=np.float32)
         steps = []
         got = extractor(volume, CPU, steps.append)
         with torch.no_grad():
-            whole = model(torch.from_numpy(normalize(volume))[None, None])[0].numpy()
+            whole = model(torch.from_numpy(network_input(volume))[None])[0].numpy()
         self.assertEqual(steps, [1.0])
         np.testing.assert_allclose(got, whole, atol=1e-5)
 

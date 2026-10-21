@@ -8,6 +8,8 @@ import numpy as np
 from vtkmodules.util.numpy_support import vtk_to_numpy
 from vtkmodules.vtkCommonDataModel import vtkImageData
 
+import torch
+
 from mrfseg import InputError, MRFSegmentation, MRFSettings
 from mrfseg.features import MAX_FEATURE_BYTES, default_feature_spacing, feature_bytes_per_voxel, feature_grid_dims
 from mrfseg.grid import Grid, voxels
@@ -50,7 +52,7 @@ class ReferenceVolumeTest(unittest.TestCase):
 
 class SettingsTest(unittest.TestCase):
     def test_rejects_nonsense(self):
-        for bad in [dict(feature_spacing=0), dict(spatial_lengthscale=-1), dict(sweeps=-1), dict(sweeps=2.5),
+        for bad in [dict(feature_spacing=0), dict(spatial_lengthscale=-1), dict(sweeps=-1), dict(sweeps=2.5), dict(connected="yes"),
                     dict(coupling=float("nan")), dict(device="gpu"), dict(contrast=float("inf")),
                     # What JSON could send: none of these is what it looks like.
                     dict(sweeps=True), dict(coupling=True), dict(basic_edges="false"), dict(feature_spacing="1"),
@@ -220,7 +222,7 @@ class GenerateSegmentationTest(unittest.TestCase):
         # image whose grid is the feature grid, so that nothing is interpolated in between.
         volume, _ = sphere_volume(spacing=(2.5, 2.5, 2.5))
         points, labels = sphere_points()
-        without = MRFSegmentation(volume, dataclasses.replace(FAST, coupling=0.0, feature_spacing=2.5), stub_extractor).generate_segmentation(points, labels)
+        without = MRFSegmentation(volume, dataclasses.replace(FAST, coupling=0.0, feature_spacing=2.5, connected=False), stub_extractor).generate_segmentation(points, labels)
         probability, a = voxels(without.probability), voxels(without.unary)
         ijk = np.rint(Grid(volume).world_to_index(points)).astype(int)
         free = np.ones(probability.shape, dtype=bool)
@@ -322,26 +324,32 @@ class GenerateSegmentationTest(unittest.TestCase):
             with self.subTest(bad), self.assertRaises(ValueError):
                 self.segmentation.labelmap(bad)
 
-    def test_a_connected_labelmap_keeps_what_the_inside_points_touch(self):
-        connected = voxels(self.segmentation.labelmap(0.5, connected=True))
-        plain = voxels(self.segmentation.labelmap(0.5))
-        self.assertTrue((connected <= plain).all())
-        ijk = np.rint(Grid(self.volume).world_to_index(self.points[self.labels > 0])).astype(int)
-        self.assertTrue(connected[ijk[:, 2], ijk[:, 1], ijk[:, 0]].all())
-        # An island far from every inside point goes; the sphere stays.
-        from mrfseg.segmentation import _keep_connected
+    def test_connected_keeps_what_the_inside_points_reach(self):
+        from mrfseg.mrf import Clamps
+        from mrfseg.segmentation import select_connected
 
-        labels = plain.copy()
-        labels[0, 0, :3] = 1
-        _keep_connected(labels, self.result.seeds)
-        self.assertEqual(int(labels[0, 0, :3].sum()), 0)
-        self.assertEqual(int(labels.sum()), int(plain.sum()) if plain[0, 0, :3].sum() == 0 else int(labels.sum()))
-        # With no seeds, the largest component stays.
-        labels = plain.copy()
-        labels[0, 0, :3] = 1
-        _keep_connected(labels, np.zeros((0, 3), dtype=np.int64))
-        self.assertEqual(int(labels[0, 0, :3].sum()), 0)
-        self.assertGreater(int(labels.sum()), 100)
+        # Two blobs; an inside clamp in one of them.
+        marginal = torch.zeros((6, 6, 12))
+        marginal[1:4, 1:4, 1:4] = 0.9
+        marginal[1:4, 1:4, 8:11] = 0.8
+        marginal[0, 0, 0] = 0.3  # below the threshold: never a component
+        clamps = Clamps.from_voxels(np.array([[2, 2, 2]]), np.array([1]), (6, 6, 12), torch.device("cpu"))
+        kept = select_connected(marginal, clamps)
+        self.assertEqual(kept, 1)
+        self.assertAlmostEqual(float(marginal[2, 2, 2]), 0.9, places=6)
+        self.assertEqual(float(marginal[2, 2, 9]), 0.0)  # the other blob is gone
+        self.assertAlmostEqual(float(marginal[0, 0, 0]), 0.3, places=6)  # below the threshold, left alone
+        # Without inside clamps nothing is dropped.
+        marginal = torch.full((3, 3, 3), 0.7)
+        self.assertIsNone(select_connected(marginal, Clamps.from_voxels(np.array([[0, 0, 0]]), np.array([-1]), (3, 3, 3), torch.device("cpu"))))
+        self.assertAlmostEqual(float(marginal.min()), 0.7, places=6)
+        # End to end: the rule is on by default and the inside points are in the sphere, so it changes nothing there...
+        self.assertTrue(FAST.connected)
+        self.assertEqual(self.result.inference.components, 1)
+        without = MRFSegmentation(self.volume, dataclasses.replace(FAST, connected=False), stub_extractor).generate_segmentation(self.points, self.labels)
+        self.assertIsNone(without.inference.components)
+        np.testing.assert_allclose(voxels(without.probability) >= 0.5, voxels(self.result.probability) >= 0.5)
+        # ...and with outside points only in Learned-like use (no inside point) it is not applied.
 
 
 class OddImagesTest(unittest.TestCase):

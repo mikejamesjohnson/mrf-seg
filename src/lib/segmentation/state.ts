@@ -41,6 +41,8 @@ export interface InferenceSummary {
   /** The largest change of any probability in the last sweep. */
   delta: number;
   converged: boolean;
+  /** How many connected components the inside points kept (the Connected setting); null when nothing was dropped. */
+  components: number | null;
 }
 
 /** What the maps show: the last successful Generate. */
@@ -80,11 +82,9 @@ export interface Product<Built> {
   built: (Built & { seconds: number; generation: number }) | null;
 }
 
-export interface LabelmapState extends Product<{ threshold: number; connected: boolean; voxels: number }> {
+export interface LabelmapState extends Product<{ threshold: number; voxels: number }> {
   /** Voxels with p(y = 1) at least this are labelled 1. */
   threshold: number;
-  /** Keep only the connected components holding an inside point (the largest, with none). */
-  connected: boolean;
 }
 
 export interface SurfaceState extends Product<{ source: SurfaceSource; level: number; triangles: number }> {
@@ -168,7 +168,7 @@ export function productStale(state: SceneState, key: ProductKey): boolean {
   const generation = state.segmentation.generation;
   if (key === "labelmap") {
     const built = state.labelmap.built;
-    return !built || built.generation !== generation || built.threshold !== state.labelmap.threshold || built.connected !== state.labelmap.connected;
+    return !built || built.generation !== generation || built.threshold !== state.labelmap.threshold;
   }
   const built = state.surface.built;
   return !built || built.generation !== generation || built.source !== state.surface.source || built.level !== surfaceLevel(state.surface);
@@ -194,7 +194,7 @@ function freshSegmentation(imageId: DatasetId | null, settings: MRFSettings, def
 
 export const segmentationSlice: StoreSlice<SegmentationSlice> = (set) => ({
   segmentation: freshSegmentation(null, DEFAULT_MRF_SETTINGS, null),
-  labelmap: { threshold: 0.5, connected: true, status: { state: "idle" }, built: null },
+  labelmap: { threshold: 0.5, status: { state: "idle" }, built: null },
   surface: { source: "probability", threshold: 0.5, status: { state: "idle" }, built: null },
   autoUpdate: { segmentation: false, labelmap: false, surface: false },
   extractors: {},

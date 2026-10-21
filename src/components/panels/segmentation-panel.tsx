@@ -171,7 +171,7 @@ export function UnaryPanel() {
         <Hint>
           {extractor === "basic"
             ? "Each voxel is compared with the inside points (what lumen looks like here) against the image as a whole and the outside points (what it does not): a kernel density ratio. A voxel like no point is background."
-            : "The network's unary logit at each voxel, trained with the coupling and the inference below."}
+            : "The network's unary logit at each voxel. It sees the points: an inside point selects the vessel it is in, an outside point drops the structure it is in, and with no points it segments every coronary. Generate re-runs it in windows around the points."}
           {defaultsFrom === "learned" && extractor === "learned" && " Loaded from the checkpoint: the settings it was trained with."}
         </Hint>
         <Button size="xs" variant="ghost" className="shrink-0 text-muted-foreground" onClick={resetPotentials} title="Back to the current extractor's potential and inference settings">
@@ -208,7 +208,8 @@ export function InferencePanel() {
           <>
             {" "}
             Last Generate: {generated.inference.sweeps} sweeps, last change {generated.inference.delta.toExponential(1)}
-            {generated.inference.converged ? ", converged" : ", not yet converged (more sweeps would change it)"}.
+            {generated.inference.converged ? ", converged" : ", not yet converged (more sweeps would change it)"}
+            {generated.inference.components !== null && `; kept ${generated.inference.components} connected ${generated.inference.components === 1 ? "component" : "components"}`}.
           </>
         )}
       </Hint>

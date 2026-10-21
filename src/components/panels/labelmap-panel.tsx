@@ -3,7 +3,7 @@
 import { Grid3x3 } from "lucide-react";
 
 import { StepButton } from "@/components/panels/auto-update-panel";
-import { ColorRow, Hint, ProductStatus, Row, SamplingRow, SliderRow, SwitchRow, useNode } from "@/components/panels/controls";
+import { ColorRow, ProductStatus, Row, SamplingRow, SliderRow, SwitchRow, useNode } from "@/components/panels/controls";
 import { NumberField } from "@/components/ui/number-field";
 import { currentImage } from "@/lib/scene/datasets";
 import { useSceneStore } from "@/lib/scene/store";
@@ -38,19 +38,9 @@ export function LabelmapProduct() {
           aria-label="Labelmap threshold"
         />
       </Row>
-      <SwitchRow
-        id="labelmap-connected"
-        label="Connected to the inside points"
-        checked={labelmap.connected}
-        onChange={(connected) => useSceneStore.getState().setProduct("labelmap", { connected })}
-      />
-      <Hint>
-        The CRF cannot promise one connected vessel tree: islands of lumen-like voxels are labelled too. Connected keeps only the components an inside point
-        touches (the largest, with no inside point).
-      </Hint>
       <ProductStatus product="labelmap">
         {built &&
-          `${built.voxels.toLocaleString()} voxels (${((built.voxels * voxelMm3) / 1000).toFixed(1)} mL) with p ≥ ${built.threshold}${built.connected ? ", connected" : ""}, ${built.seconds.toFixed(2)} s.`}
+          `${built.voxels.toLocaleString()} voxels (${((built.voxels * voxelMm3) / 1000).toFixed(1)} mL) with p ≥ ${built.threshold}, ${built.seconds.toFixed(2)} s.`}
       </ProductStatus>
       {node && <Appearance node={node} />}
     </div>

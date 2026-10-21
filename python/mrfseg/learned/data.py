@@ -8,11 +8,14 @@ what the editor segments.
 
 The clicks are what a user might have placed on the patch by the time the network is asked
 (`clicks.random_clicks`): a few inside, spread over the lumen's connected components so a small
-branch gets its share, and a few outside, mostly within `near_wall` mm of the lumen, where a
-user's outside clicks go. How many of each is drawn per item, from none at all (the network
-must segment with no help, as the editor lets it) to `max_inside` and `max_outside`. The clicks
-are clamped during the mean-field inference the loss is taken through, and so are the voxels the
-network can rely on; everything else it has to earn.
+branch gets its share, and a few outside -- some on a vessel that got no inside click, where a
+user clicks to drop what is not wanted, the rest mostly within `near_wall` mm of the lumen,
+where a user's outside clicks go. How many of each is drawn per item, from none at all (the
+network must segment with no help, as the editor lets it) to `max_inside` and `max_outside`.
+The network sees the clicks as two input channels (`learned.click_maps`), and the target is
+conditioned on them (`clicks.conditioned_target`): with inside clicks, the lumen connected to
+them and nothing else; without, all of it; less a vessel with an outside click and no inside
+one. The clicks are clamped during the mean-field inference the loss is taken through as well.
 
 Augmentation: the 48 symmetries of the cube (flips and axis permutations; the grid is isotropic
 and anatomy's orientation means nothing to the potentials) and a little HU scale and offset
@@ -31,8 +34,8 @@ import numpy as np
 import torch
 from scipy import ndimage
 
-from . import normalize
-from .clicks import random_clicks
+from . import network_input
+from .clicks import conditioned_target, random_clicks
 from .prepare import read_index, read_splits
 
 SIX = ndimage.generate_binary_structure(3, 1)  # 6-connectivity, as the CRF's edges
@@ -47,7 +50,8 @@ class PatchConfig:
     max_outside: int = 4                # outside clicks per patch, at most (drawn uniformly from 0)
     no_click_share: float = 0.2         # of patches given no clicks at all, whatever the draw
     near_wall: float = 2.0              # mm: how close to the lumen an outside click near the wall is
-    near_wall_share: float = 2.0 / 3.0  # of the outside clicks, near the wall
+    near_wall_share: float = 2.0 / 3.0  # of the outside clicks not on a vessel, near the wall
+    on_lumen_share: float = 0.3         # of the outside clicks, on a vessel that got no inside click
     margin: int = 4                     # voxels a click keeps from the patch's faces
     vessel_share: float = 0.8           # of patches placed near a labelled voxel
     jitter: int = 32                    # voxels: how far that voxel may be from the patch's centre
@@ -138,9 +142,10 @@ def symmetry(arrays: list[np.ndarray], rng: np.random.Generator) -> list[np.ndar
 
 
 def make_item(case: Case, cfg: PatchConfig, rng: np.random.Generator, augment: bool) -> dict:
-    """One training item from `case`: the normalised patch (1, s, s, s) float32, the lumen
-    label (s, s, s) uint8, the clicks (MAX_CLICKS, 4) int64 rows of (z, y, x, label) padded with
-    label 0, and where the patch came from."""
+    """One training item from `case`: the network's input (IN_CHANNELS, s, s, s) float32 (the
+    normalised patch and the click maps), the target (s, s, s) uint8 (the lumen as the clicks
+    condition it, `clicks.conditioned_target`), the clicks (MAX_CLICKS, 4) int64 rows of
+    (z, y, x, label) padded with label 0, and where the patch came from."""
     origin = patch_origin(case, cfg, rng)
     hu = cut(case.image, origin, cfg.size, fill=int(case.meta.get("hu_range", [-1024])[0])).astype(np.float32)
     label = cut(case.label, origin, cfg.size, fill=0)
@@ -152,10 +157,11 @@ def make_item(case: Case, cfg: PatchConfig, rng: np.random.Generator, augment: b
         n_inside = n_outside = 0
     else:
         n_inside, n_outside = int(rng.integers(0, cfg.max_inside + 1)), int(rng.integers(0, cfg.max_outside + 1))
-    clicks = random_clicks(lumen, rng, n_inside, n_outside, case.spacing, cfg.near_wall, cfg.near_wall_share, cfg.margin)
+    clicks = random_clicks(lumen, rng, n_inside, n_outside, case.spacing, cfg.near_wall, cfg.near_wall_share, cfg.margin, cfg.on_lumen_share)
     padded = np.zeros((MAX_CLICKS, 4), dtype=np.int64)
     padded[: len(clicks)] = clicks[:MAX_CLICKS]
-    return dict(image=normalize(hu)[None], label=lumen.astype(np.uint8), clicks=padded, case=case.id, origin=origin)
+    target = conditioned_target(lumen, padded)
+    return dict(image=network_input(hu, padded), label=target.astype(np.uint8), clicks=padded, case=case.id, origin=origin)
 
 
 class PatchDataset(torch.utils.data.Dataset):

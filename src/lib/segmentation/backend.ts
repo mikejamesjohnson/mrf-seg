@@ -59,7 +59,6 @@ export interface SessionStatus {
 
 export interface LabelmapSummary {
   threshold: number;
-  connected: boolean;
   voxels: number;
   seconds: number;
 }
@@ -153,8 +152,8 @@ export async function fetchMap(sessionId: string, quantity: MapQuantity, voxels:
   return new Type(await bytes(`sessions/${sessionId}/segmentation/${quantity}?encoding=compact`, `${quantity} map`, voxels * Type.BYTES_PER_ELEMENT));
 }
 
-export async function buildLabelmap(sessionId: string, threshold: number, connected: boolean): Promise<LabelmapSummary> {
-  return (await call(`sessions/${sessionId}/labelmap`, postJson({ threshold, connected }))).json();
+export async function buildLabelmap(sessionId: string, threshold: number): Promise<LabelmapSummary> {
+  return (await call(`sessions/${sessionId}/labelmap`, postJson({ threshold }))).json();
 }
 
 /** The last labelmap: one uint8 per voxel, 1 inside, in VTK order. */

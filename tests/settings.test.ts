@@ -78,7 +78,7 @@ describe("MRF settings", () => {
   it("group the potentials and the inference as the backend's model does", () => {
     expect(settingGroup("Unary potential").fields.map((field) => field.key)).toEqual(["featureLengthscale", "spatialLengthscale", "priorLogit", "unaryScale", "unaryShift"]);
     expect(settingGroup("Pairwise potential").fields.map((field) => field.key)).toEqual(["coupling", "contrast", "couplingFloor"]);
-    expect(settingGroup("Inference").fields.map((field) => field.key)).toEqual(["sweeps"]);
+    expect(settingGroup("Inference").fields.map((field) => field.key)).toEqual(["sweeps", "connected"]);
     const potentials = [...settingGroup("Unary potential").fields, ...settingGroup("Pairwise potential").fields, ...settingGroup("Inference").fields].map((field) => field.key);
     expect([...POTENTIAL_KEYS].sort()).toEqual([...potentials].sort());
   });

@@ -45,6 +45,8 @@ export interface MRFSettings {
   couplingFloor: number;
   /** Mean-field sweeps; each updates both parities of the checkerboard. */
   sweeps: number;
+  /** Keep only the lumen the inside points connect to (through p >= 0.5); the probability is 0 on the rest. */
+  connected: boolean;
 }
 
 /** What the backend says about an extractor before it is chosen (`GET /extractors`). */
@@ -72,6 +74,7 @@ export const POTENTIAL_KEYS = [
   "contrast",
   "couplingFloor",
   "sweeps",
+  "connected",
 ] as const satisfies readonly (keyof MRFSettings)[];
 
 /**
@@ -109,6 +112,7 @@ export const DEFAULT_MRF_SETTINGS: MRFSettings = {
   contrast: 100,
   couplingFloor: 0.1,
   sweeps: 50,
+  connected: true,
 };
 
 /** What the panel and the status line call each extractor. */
@@ -166,7 +170,7 @@ export const SETTING_GROUPS: SettingGroup[] = [
         label: "Extractor",
         hint:
           "Basic: the image's brightness at several scales, with handcrafted potentials from the points. " +
-          "Learned: our own network's potentials, trained on coronary CTA (needs its checkpoint, MRFSEG_LEARNED_WEIGHTS). " +
+          "Learned: our own network's potentials, trained on coronary CTA; it sees the points and is re-run around them (needs its checkpoint, MRFSEG_LEARNED_WEIGHTS). " +
           "Changing it extracts the features again, and loads that extractor's settings.",
         options: (Object.keys(EXTRACTOR_LABELS) as FeatureExtractorName[]).map((value) => ({ value, label: EXTRACTOR_LABELS[value] })),
       },
@@ -265,7 +269,7 @@ export const SETTING_GROUPS: SettingGroup[] = [
         kind: "number",
         key: "unaryShift",
         label: "Shift",
-        hint: "Added to every unary logit the network gives, to move its decision boundary: above 0 segments more, below 0 less.",
+        hint: "Added to every unary logit the network gives, to move its decision boundary: above 0 segments more, below 0 less. The network itself decides what each point selects or deselects.",
         min: -20,
         max: 20,
         step: 0.5,
@@ -325,6 +329,14 @@ export const SETTING_GROUPS: SettingGroup[] = [
         max: 2000,
         step: 10,
         integer: true,
+      },
+      {
+        kind: "check",
+        key: "connected",
+        label: "Connected to the inside points",
+        hint:
+          "After the sweeps, keep only the lumen an inside point connects to through voxels with p ≥ 0.5, and set p to 0 on the rest: " +
+          "an inside point reaches as far as its vessel reaches, and unclicked vessels drop out. With no inside points, everything stays. The labelmap and the surface follow.",
       },
     ],
   },

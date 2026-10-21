@@ -45,9 +45,15 @@ any amount of context (a network's receptive field), and $p(I)$ is never modelle
 
 A clicked voxel $k$ is *clamped*: $y_k = \ell_k$ throughout. The conditional of the other
 voxels is the same kind of model, with each clamped neighbour $k$ of $i$ adding
-$w_{ik}\,(2\ell_k - 1)$ to $a_i$. A point reaches further than its neighbours only through the
-coupling, one voxel per half-sweep (below), and through whatever the potentials themselves do
-with it (the Basic unary is built from the points; the network sees none).
+$w_{ik}\,(2\ell_k - 1)$ to $a_i$. On its own a clamp reaches further than its neighbours only
+through the coupling, one voxel per half-sweep (below). The points reach further in two other
+ways: through the potentials, which are built from them (the Basic unary is a kernel density of
+the points; the network takes click maps as input and is re-run around the points), and through
+**connectivity**: after the sweeps, with the setting `connected` on, the face-connected
+components of $\{m_i \ge 0.5\}$ that hold an inside point are kept and $m_i$ is set to 0 on the
+others. An inside point thus selects the vessel it is in, as far as that vessel reaches through
+voxels the model calls lumen, and an unclicked vessel drops out of the probability map, the
+labelmap and the surface alike.
 
 ## 4. Inference: mean field
 
@@ -137,32 +143,48 @@ the shrinking bias of §6.
 ## 6. Learned: the network's potentials
 
 A 3D U-Net $g_\theta$ (five resolutions, 22.6 M parameters, normalised per voxel over its
-channels so windows of a volume agree where they overlap) maps the HU volume, on the fixed
-window $(\mathrm{clip}(\mathrm{HU}, -200, 1000) - 100) / 300$, to four channels per voxel:
+channels so windows of a volume agree where they overlap) takes three channels per voxel -- the
+HU volume on the fixed window $(\mathrm{clip}(\mathrm{HU}, -200, 1000) - 100) / 300$, and two
+*click maps* $c^{\text{in}}, c^{\text{out}}$, each the largest Gaussian mark
+$\exp(-|p_i - p_k|^2 / 2\sigma^2)$ ($\sigma$ = 2 voxels) of any point $k$ of that label -- and
+gives four channels per voxel:
 
 $$
-a_i = g_\theta(I)_{i,0} + s, \qquad w_{i,+d} = \lambda \cdot \mathrm{softplus}\big(g_\theta(I)_{i,d}\big), \quad d \in \{z, y, x\},
+a_i = g_\theta(I, c)_{i,0} + s, \qquad w_{i,+d} = \lambda \cdot \mathrm{softplus}\big(g_\theta(I, c)_{i,d}\big), \quad d \in \{z, y, x\},
 $$
 
 - $s$ (`unary_shift`) and $\lambda$ (`coupling`) are the editor's knobs, 0 and 1 as trained;
 - softplus keeps every coupling non-negative, so the energy stays submodular;
 - the head's unary bias starts at $-4$ (lumen is rare) and its coupling bias where softplus gives 0.1: small, so the first sweeps are nearly the identity and the gradient reaches the unary; with couplings near 1 the mean field saturates at the all-background consensus and the network learns to smooth harder instead of finding lumen.
 
-The network runs once per image, in overlapping 96³ windows blended with Gaussian weights; its
-output is kept as the image's "features", and a Generate is the inference alone. The couplings
-can differ by direction, which is what lets the model be cheap to cut across a wall and expensive
-to cut along a vessel -- the fix for the shrinking bias: a tube of radius $r$ voxels survives
-isotropic smoothing of strength $w$ against a unary $a$ only if $r > 2w/a$, and coronary lumen is
-about 2 voxels in radius at 0.5 mm.
+The click maps are hints, not potentials: what a point selects, and how far along what, is the
+network's to decide from the image, so a point in one of two vessels 2 mm apart need not touch
+the other. Its reach is bounded by the receptive field (about 50 mm); beyond that, §3's
+connectivity carries the selection along the vessel.
+
+At session open the network runs once over the whole image with empty click maps, in overlapping
+96³ windows blended with Gaussian weights: the automatic potentials, kept as the image's
+"features". A Generate with points re-runs it only in 96³ windows centred on the points (one
+window per cluster of points within a quarter window), with the click maps as input, and each
+window's output replaces the automatic one at its centre and fades into it toward its faces.
+The couplings can differ by direction, which is what lets the model be cheap to cut across a
+wall and expensive to cut along a vessel -- the fix for the shrinking bias: a tube of radius $r$
+voxels survives isotropic smoothing of strength $w$ against a unary $a$ only if $r > 2w/a$, and
+coronary lumen is about 2 voxels in radius at 0.5 mm.
 
 ## 7. Training
 
 Patches of 96³ voxels are cut from the 0.5 mm cache (560 training scans), mostly centred near
 vessels, with the 48 symmetries of the cube and a little HU jitter as augmentation. For each
 patch a user's clicks are simulated: 0-3 inside (spread over the lumen's connected components),
-0-4 outside (two thirds within 2 mm of the wall), and a fifth of the patches get none. With
-$m = \mathrm{MF}_T(a, w, \mathcal C)$ the marginals after $T = 20$ sweeps with the clicks clamped,
-differentiable in $a$ and $w$ (`mrf.mean_field_batched`), and $y$ the lumen label, the loss is
+0-4 outside (three in ten on a vessel that got no inside click, the rest mostly within 2 mm of
+the wall), and a fifth of the patches get none. The target $y$ is the lumen *as the clicks
+condition it*: with inside clicks, the 26-connected components that hold one; without, all of
+it; less any component that holds an outside click and no inside one. So the network is trained
+to read a click as "select the structure I am in" or "drop the structure I am in", and to
+segment every coronary when there is none. With $m = \mathrm{MF}_T(a, w, \mathcal C)$ the
+marginals after $T = 20$ sweeps with the clicks clamped, differentiable in $a$ and $w$
+(`mrf.mean_field_batched`), the loss is
 
 $$
 \mathcal L = \mathrm{BCE}(m, y) + \mathrm{Dice}_{\text{soft}}(m, y) + \tfrac12\,\mathrm{BCE}(\sigma(a), y),
@@ -181,10 +203,12 @@ checkpoint with the best mean of those Dice values.
 
 ## 8. What the model does not do, yet
 
-Connectivity. Two coronary trees meet only through the aorta, which is not labelled, so the
-label maps have two 6-connected components (sometimes three or four, from gaps), no loops and no
-cavities. A pairwise CRF cannot express "connected to a root"; the labelmap's **Connected** option
-enforces it after the fact. The principled version is a tree constraint -- a shortest-path forest
-from the inside points with the submodular potential $\infty \cdot [y_i = 1, y_{\pi(i)} = 0]$ on
-each voxel and its parent $\pi(i)$ -- which keeps the MAP labeling exactly solvable by min-cut and,
-on the tree alone, gives exact marginals in two passes. That is the next step after the network.
+Connectivity inside the inference. Two coronary trees meet only through the aorta, which is not
+labelled, so the label maps have two 6-connected components (sometimes three or four, from
+gaps), no loops and no cavities. A pairwise CRF cannot express "connected to a root"; the
+`connected` rule of §3 enforces it after the sweeps, on the marginals. The principled version is
+a tree constraint -- a shortest-path forest from the inside points with the submodular potential
+$\infty \cdot [y_i = 1, y_{\pi(i)} = 0]$ on each voxel and its parent $\pi(i)$ -- which keeps the
+MAP labeling exactly solvable by min-cut and, on the tree alone, gives exact marginals in two
+passes; it would also let a click bridge a gap the model leaves at a stenosis, which the rule of
+§3 cannot. That is the next step after the network.

@@ -192,14 +192,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def make_labelmap(self, session_id: str) -> None:
         session = self.session(session_id)
-        body = self.read_json()
-        threshold = number_field(body, "threshold", 0.5)
-        connected = body.get("connected", False)
-        if not isinstance(connected, bool):
-            raise HttpError(400, '"connected" must be true or false')
+        threshold = number_field(self.read_json(), "threshold", 0.5)
         started = time.perf_counter()
-        labels = voxels(session.build_labelmap(threshold, connected))
-        summary = {"threshold": threshold, "connected": connected, "voxels": int(np.count_nonzero(labels))}
+        labels = voxels(session.build_labelmap(threshold))
+        summary = {"threshold": threshold, "voxels": int(np.count_nonzero(labels))}
         self.send_json(200, {**summary, "seconds": time.perf_counter() - started})
 
     def get_labelmap(self, session_id: str) -> None:
