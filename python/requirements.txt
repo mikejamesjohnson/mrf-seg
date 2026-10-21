@@ -1,0 +1,5 @@
+numpy
+vtk
+scipy
+torch
+SimpleITK

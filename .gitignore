@@ -1,0 +1,45 @@
+# Editor (Next.js): dependencies and build output
+/node_modules
+/.next/
+/out/
+/build
+next-env.d.ts
+*.tsbuildinfo
+.eslintcache
+/coverage
+
+# Python core: its virtual environment, bytecode and tool caches
+python/.venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Image data stays out of the repository. The training cache (77 GB) and the test images live in
+# the pseg3d folder and are given by absolute path; anything copied here is ignored too.
+/data/
+
+# Training (python/mrfseg/learned): runs with their checkpoints, logs and evaluations, wherever
+# they are started from, and any checkpoint copied into the tree. The editor finds a checkpoint
+# through MRFSEG_LEARNED_WEIGHTS or ~/.cache/mrfseg/learned.pt, outside the tree.
+runs/
+*.pt
+*.pth
+*.part
+metrics.json
+
+# Local configuration and secrets
+.env*
+*.pem
+
+# Operating system and editor leftovers
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+npm-debug.log*
+*.log

@@ -1,0 +1,12 @@
+{
+    // TypeScript (the editor in src/) needs nothing here: VS Code reads tsconfig.json and node_modules.
+
+    // Python core (python/): its own virtual environment, see README.
+    "python.defaultInterpreterPath": "${workspaceFolder}/python/.venv/bin/python",
+    "python.analysis.extraPaths": ["${workspaceFolder}/python"],
+
+    // Core tests in python/tests for the Testing panel.
+    "python.testing.unittestEnabled": true,
+    "python.testing.unittestArgs": ["-s", "python/tests", "-t", "python", "-p", "test_*.py"],
+    "python.testing.pytestEnabled": false
+}
