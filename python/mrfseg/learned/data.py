@@ -63,26 +63,30 @@ class PatchConfig:
 
 
 class Case:
-    """One cached scan, read lazily and memory-mapped, so a data-loader worker holds no copy."""
+    """One cached scan, read lazily and memory-mapped, so a data-loader worker holds no copy.
+
+    The maps are opened for each access and dropped with the patch cut from them (`cut` copies):
+    a memory map holds a file descriptor for as long as it lives, and 560 scans times two maps
+    in each of several workers is far more than a process is allowed open. The page cache makes
+    opening a file again cheap.
+    """
 
     def __init__(self, cache: Path, meta: dict) -> None:
         self.cache, self.meta = Path(cache), meta
         self.id: str = meta["id"]
         self.shape = tuple(meta["shape"])
         self.spacing = float(meta["spacing"])
-        self._image = self._label = self._lumen = None
+        self._lumen = None
 
     @property
     def image(self) -> np.ndarray:
-        if self._image is None:
-            self._image = np.load(self.cache / f"{self.id}.image.npy", mmap_mode="r")
-        return self._image
+        """(z, y, x) int16 HU, memory-mapped: read what you need and let it go."""
+        return np.load(self.cache / f"{self.id}.image.npy", mmap_mode="r")
 
     @property
     def label(self) -> np.ndarray:
-        if self._label is None:
-            self._label = np.load(self.cache / f"{self.id}.label.npy", mmap_mode="r")
-        return self._label
+        """(z, y, x) uint8, memory-mapped, likewise."""
+        return np.load(self.cache / f"{self.id}.label.npy", mmap_mode="r")
 
     @property
     def lumen(self) -> np.ndarray:
@@ -126,10 +130,11 @@ def patch_origin(case: Case, cfg: PatchConfig, rng: np.random.Generator) -> np.n
 
 
 def cut(volume: np.ndarray, origin: np.ndarray, size: int, fill) -> np.ndarray:
-    """`volume[origin : origin + size]` per axis, padded with `fill` where the volume ends."""
+    """`volume[origin : origin + size]` per axis, padded with `fill` where the volume ends. A
+    copy, so a memory-mapped `volume` can be closed once this returns."""
     stop = origin + size
     region = tuple(slice(int(o), int(min(s, n))) for o, s, n in zip(origin, stop, volume.shape))
-    block = np.asarray(volume[region])
+    block = np.array(volume[region])
     pad = [(0, size - (sl.stop - sl.start)) for sl in region]
     return np.pad(block, pad, mode="constant", constant_values=fill) if any(p[1] for p in pad) else block
 

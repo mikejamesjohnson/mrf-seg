@@ -139,6 +139,21 @@ def _dice(prediction: np.ndarray, target: np.ndarray) -> float:
 # ------------------------------------------------------------------ the run
 
 
+def raise_open_file_limit() -> None:
+    """Lift the soft limit on open files to the hard limit (often 1024 against 1 M): the workers
+    open memory maps and shared-memory segments by the thousand over a run."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        elif hard == resource.RLIM_INFINITY and soft < 65536:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (65536, hard))
+    except (ImportError, ValueError, OSError):
+        pass  # not Unix, or not allowed: the strategy above and the per-access maps are the real fix
+
+
 def pick_device(name: str) -> torch.device:
     if name != "auto":
         return torch.device(name)
@@ -205,6 +220,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--stop-after", type=int, default=None, help="end this piece after this many steps")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
+
+    # Data-loader workers hand tensors to the main process through shared memory; the default
+    # "file_descriptor" strategy leaks descriptors over a long run until "too many open files".
+    torch.multiprocessing.set_sharing_strategy("file_system")
+    raise_open_file_limit()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -278,8 +298,9 @@ def main(argv: list[str] | None = None) -> None:
         d = clicks["dice"]
         at = lambda k: d[k - 1] if len(d) >= k else math.nan  # noqa: E731
         score = float(np.nanmean([clicks["dice0"], at(1), at(3), at(5)])) if d else -v_loss
+        after = ", ".join(f"{k}: {at(k):.3f}" for k in (1, 3, 5) if len(d) >= k)  # only the click counts that were simulated
         print(f"  val @ {step}: loss {v_loss:.4f} dice {v_stats.get('dice', math.nan):.3f} | simulated user: "
-              f"0 clicks {clicks['dice0']:.3f}, 1: {at(1):.3f}, 3: {at(3):.3f}, 5: {at(5):.3f}, leak {clicks['leak']:.3f}", flush=True)
+              f"0 clicks {clicks['dice0']:.3f}, {after}, leak {clicks['leak']:.3f}", flush=True)
         model.train()
         return dict(val_loss=v_loss, val_dice=v_stats.get("dice", math.nan), dice0=clicks["dice0"], dice1=at(1), dice3=at(3), dice5=at(5), leak5=clicks["leak"], score=score)
 
