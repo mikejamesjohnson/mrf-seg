@@ -23,11 +23,10 @@ class MapEncoding:
     magnitude to the type's largest value, which keeps zero exact."""
 
 
-#: The three maps of a `Segmentation`, by the name of its field, in the order the editor lists
-#: them. A probability needs no finer than 1/255; the unary logit and the coupling fill int16.
+#: The two maps of a `Segmentation`, by the name of its field, in the order the editor lists
+#: them. A probability needs no finer than 1/255; the log-affinity fills int16.
 MAPS: dict[str, MapEncoding] = {
-    "unary": MapEncoding(np.int16, None),
-    "coupling": MapEncoding(np.int16, None),
+    "affinity": MapEncoding(np.int16, None),
     "probability": MapEncoding(np.uint8, 1 / 255),
 }
 

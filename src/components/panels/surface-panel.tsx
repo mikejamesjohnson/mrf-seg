@@ -3,19 +3,14 @@
 import { Box } from "lucide-react";
 
 import { StepButton } from "@/components/panels/auto-update-panel";
-import { ChoiceButtons, ColorRow, Hint, ProductStatus, Row, SliderRow, SwitchRow, useNode, type ChoiceOption } from "@/components/panels/controls";
+import { ColorRow, Hint, ProductStatus, Row, SliderRow, SwitchRow, useNode } from "@/components/panels/controls";
 import { NumberField } from "@/components/ui/number-field";
 import { useSceneStore } from "@/lib/scene/store";
-import type { SurfaceNode, SurfaceSource } from "@/lib/scene/types";
+import type { SurfaceNode } from "@/lib/scene/types";
 import { buildSegmentationSurface } from "@/lib/segmentation/products";
 import { canBuild, isBusy } from "@/lib/segmentation/state";
 
-const SOURCES: ChoiceOption<SurfaceSource>[] = [
-  { value: "probability", label: "Probability ≥ p" },
-  { value: "unary", label: "Unary logit, a = 0" },
-];
-
-/** The surface step of the Generate section: marching cubes in the backend on a probability or on the evidence alone, and how the mesh looks. */
+/** The surface step of the Generate section: marching cubes in the backend on the probability, and how the mesh looks. */
 export function SurfaceProduct() {
   const surface = useSceneStore((s) => s.surface);
   const busy = useSceneStore(isBusy);
@@ -29,16 +24,10 @@ export function SurfaceProduct() {
       <StepButton step="surface" icon={<Box />} running={surface.status.state === "running"} disabled={busy || !ready} onClick={() => void buildSegmentationSurface()}>
         Generate surface
       </StepButton>
-      <ChoiceButtons label="Surface from" value={surface.source} options={SOURCES} onChange={(source) => set({ source })} />
-      {surface.source === "probability" && (
-        <Row label="Threshold p" hint="The probability's level set; the labelmap at the same threshold agrees with it">
-          <NumberField value={surface.threshold} min={0.01} max={0.99} step={0.05} onChange={(threshold) => set({ threshold })} aria-label="Probability threshold" />
-        </Row>
-      )}
-      <ProductStatus product="surface">
-        {built &&
-          `${built.triangles.toLocaleString()} triangles from ${built.source === "unary" ? "a = 0" : `p = ${built.level}`}, ${built.seconds.toFixed(2)} s.`}
-      </ProductStatus>
+      <Row label="Threshold p" hint="The probability's level set; the labelmap at the same threshold agrees with it, and every piece of either holds an inside point">
+        <NumberField value={surface.threshold} min={0.01} max={0.99} step={0.05} onChange={(threshold) => set({ threshold })} aria-label="Probability threshold" />
+      </Row>
+      <ProductStatus product="surface">{built && `${built.triangles.toLocaleString()} triangles from p = ${built.level}, ${built.seconds.toFixed(2)} s.`}</ProductStatus>
       {node ? <Appearance node={node} /> : <Hint>The mesh is drawn in 3D and as an outline on the slices once built.</Hint>}
     </div>
   );

@@ -12,7 +12,7 @@ import type { Vec3 } from "@/lib/world";
 import { DEFAULT_MRF_SETTINGS, IMAGE_DERIVED, needsInsidePoint, settingsForExtractor, type ExtractorInfos, type FeatureExtractorName, type MRFSettings } from "./settings";
 
 /** Where a Generate has got to: the backend's stages, then the editor fetching the maps. */
-export type TaskStage = "queued" | "features" | "potentials" | "inference" | "maps";
+export type TaskStage = "queued" | "features" | "affinities" | "seeds" | "solve" | "maps";
 
 /** A background task in the backend, as last polled. */
 export interface TaskProgress {
@@ -34,15 +34,17 @@ export interface FeaturesSummary {
   seconds: number;
 }
 
-/** How the mean-field inference ended (`sessions._inference_summary`). */
+/** How the walker's solve ended (`sessions._inference_summary`). */
 export interface InferenceSummary {
-  /** Full sweeps made: fewer than asked when it converged early. */
-  sweeps: number;
-  /** The largest change of any probability in the last sweep. */
-  delta: number;
+  /** Conjugate-gradient iterations made. */
+  iterations: number;
+  /** The largest correction the solver still proposed to any probability. */
+  residual: number;
   converged: boolean;
-  /** How many connected components the inside points kept (the Connected setting); null when nothing was dropped. */
-  components: number | null;
+  /** How many connected pieces {p >= 0.5} has: one per inside point at most, when the solve converged. */
+  components: number;
+  /** How many seeds of each kind: the inside and outside points, and the background. */
+  seeds: { inside: number; outside: number; background: number };
 }
 
 /** What the maps show: the last successful Generate. */
@@ -53,7 +55,7 @@ export interface GeneratedSegmentation {
   pointsVersion: number;
   settings: MRFSettings;
   sessionId: string;
-  seconds: { features: number; potentials: number; inference: number; maps: number };
+  seconds: { features: number; affinities: number; seeds: number; solve: number; maps: number };
   inference: InferenceSummary;
 }
 
@@ -158,9 +160,9 @@ export function needsGenerate(state: SceneState): boolean {
   return enoughPoints(state) && (state.segmentation.generated === null || segmentationIsStale(state));
 }
 
-/** The isovalue a surface is built at: 0 for the unary logit, the threshold for the probability. */
-export function surfaceLevel({ source, threshold }: Pick<SurfaceState, "source" | "threshold">): number {
-  return source === "unary" ? 0 : threshold;
+/** The isovalue a surface is built at: the probability threshold. */
+export function surfaceLevel({ threshold }: Pick<SurfaceState, "source" | "threshold">): number {
+  return threshold;
 }
 
 /** Whether building `key` now would give something other than what is there. */

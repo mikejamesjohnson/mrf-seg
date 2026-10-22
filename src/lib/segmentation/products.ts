@@ -74,7 +74,7 @@ export function buildSegmentationLabelmap(): Promise<void> {
   });
 }
 
-/** The surface the panel asks for: marching cubes on a probability, or on the unary logit's zero level. */
+/** The surface the panel asks for: marching cubes on the probability at its threshold. */
 export function buildSegmentationSurface(): Promise<void> {
   const { source } = store().surface;
   const level = surfaceLevel(store().surface);

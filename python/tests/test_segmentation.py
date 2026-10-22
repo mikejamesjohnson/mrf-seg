@@ -8,19 +8,16 @@ import numpy as np
 from vtkmodules.util.numpy_support import vtk_to_numpy
 from vtkmodules.vtkCommonDataModel import vtkImageData
 
-import torch
-
 from mrfseg import InputError, MRFSegmentation, MRFSettings
 from mrfseg.features import MAX_FEATURE_BYTES, default_feature_spacing, feature_bytes_per_voxel, feature_grid_dims
 from mrfseg.grid import Grid, voxels
-from mrfseg.mrf import MAX_MRF_BYTES
+from mrfseg.rw import MAX_GRID_BYTES
 from mrfseg.segmentation import MAX_POINTS
 from tests.helpers import StubExtractor, rotation_z, sphere_points, sphere_volume, stub_extractor
 
-# The sphere is a third of its image, not the rare structure the handcrafted unary expects of a
-# coronary lumen: the prior logit is raised and the kernels widened to say so. l_s reaches across
-# the test sphere.
-FAST = MRFSettings(feature_spacing=2.0, device="cpu", spatial_lengthscale=15.0, prior_logit=2.0, feature_lengthscale=1.0, sweeps=50)
+# The test sphere is a hard step of 300 HU in a background of 0 HU: the contrast affinities cut
+# its wall, and the outside points seed the background (nothing is below 0 HU to seed itself).
+FAST = MRFSettings(feature_spacing=2.0, device="cpu")
 
 
 class ReferenceVolumeTest(unittest.TestCase):
@@ -52,13 +49,12 @@ class ReferenceVolumeTest(unittest.TestCase):
 
 class SettingsTest(unittest.TestCase):
     def test_rejects_nonsense(self):
-        for bad in [dict(feature_spacing=0), dict(spatial_lengthscale=-1), dict(sweeps=-1), dict(sweeps=2.5), dict(connected="yes"),
-                    dict(coupling=float("nan")), dict(device="gpu"), dict(contrast=float("inf")),
+        for bad in [dict(feature_spacing=0), dict(contrast=0.5), dict(contrast=float("inf")), dict(device="gpu"), dict(feature_extractor="cnn"),
+                    dict(affinity_scale=0), dict(affinity_scale=6), dict(seed_hu=float("nan")), dict(seed_erosion=-1), dict(seed_erosion=1.5),
+                    dict(tolerance=0), dict(tolerance=0.5), dict(max_iterations=0), dict(max_iterations=2.5), dict(preconditioner="none"),
                     # What JSON could send: none of these is what it looks like.
-                    dict(sweeps=True), dict(coupling=True), dict(basic_edges="false"), dict(feature_spacing="1"),
-                    dict(prior_logit=float("nan")), dict(prior_logit="0"), dict(prior_logit=True), dict(coupling_floor=1.5),
-                    dict(feature_extractor="cnn"), dict(basic_scales=0), dict(basic_scales=9), dict(basic_scales=2.0),
-                    dict(basic_scales=True), dict(basic_edges="yes"), dict(basic_shape=1), dict(unary_scale=-1)]:
+                    dict(max_iterations=True), dict(contrast=True), dict(background_seeds="false"), dict(feature_spacing="1"),
+                    dict(seed_hu="0"), dict(seed_hu=True), dict(background_seeds=1)]:
             with self.subTest(bad), self.assertRaises(InputError):
                 MRFSettings(**bad)
 
@@ -67,30 +63,26 @@ class SettingsTest(unittest.TestCase):
             with self.subTest(field.name), self.assertRaises(InputError):
                 MRFSettings(**{field.name: object()})
         # Out of bounds, and too large for a float at all.
-        for bad in [dict(coupling=1000.0), dict(prior_logit=-21), dict(contrast=0.5), dict(feature_spacing=0.0001),
-                    dict(coupling=10**400), dict(sweeps=10**400), dict(spatial_lengthscale=float("inf"))]:
+        for bad in [dict(contrast=100000.0), dict(seed_hu=-2000), dict(feature_spacing=0.0001), dict(contrast=10**400), dict(max_iterations=10**400)]:
             with self.subTest(bad), self.assertRaisesRegex(InputError, "must be"):
                 MRFSettings(**bad)
 
-    def test_by_default_the_image_chooses_the_grid_and_the_spatial_length_scale(self):
+    def test_by_default_the_image_chooses_the_grid(self):
         defaults = MRFSettings()
-        self.assertEqual((defaults.feature_spacing, defaults.spatial_lengthscale), (None, None))
-        self.assertEqual(defaults.sweeps, 50)
-        # Basic: four blurs, without edges or shape.
-        self.assertEqual((defaults.feature_extractor, defaults.basic_scales, defaults.basic_edges, defaults.basic_shape), ("basic", 4, False, False))
+        self.assertIsNone(defaults.feature_spacing)
+        self.assertEqual((defaults.feature_extractor, defaults.contrast, defaults.background_seeds, defaults.seed_hu, defaults.seed_erosion), ("basic", 40.0, True, 0.0, 1))
+        self.assertEqual((defaults.tolerance, defaults.max_iterations, defaults.preconditioner), (1e-4, 1000, "multigrid"))
         volume, _ = sphere_volume(spacing=(2.0, 1.5, 2.5))
         segmentation = MRFSegmentation(volume, MRFSettings(), stub_extractor)
-        # The finest voxel size, and 20 of the largest.
-        self.assertEqual((segmentation.settings.feature_spacing, segmentation.settings.spatial_lengthscale), (1.5, 50.0))
-        # Given values stay; a new image chooses again.
-        self.assertEqual(MRFSegmentation(volume, MRFSettings(feature_spacing=3.0, spatial_lengthscale=7.0)).settings.spatial_lengthscale, 7.0)
+        self.assertEqual(segmentation.settings.feature_spacing, 1.5)  # the finest voxel size
+        # A given value stays; a new image chooses again.
+        self.assertEqual(MRFSegmentation(volume, MRFSettings(feature_spacing=3.0)).settings.feature_spacing, 3.0)
         segmentation.reference_volume, _ = sphere_volume(spacing=(1.0, 1.0, 1.25))
-        self.assertEqual((segmentation.settings.feature_spacing, segmentation.settings.spatial_lengthscale), (1.0, 25.0))
+        self.assertEqual(segmentation.settings.feature_spacing, 1.0)
         # But no finer than 0.5 mm, the grid the network is trained on and lumen is 2 voxels across.
         segmentation.reference_volume, _ = sphere_volume(spacing=(0.3, 0.3, 0.4))
         self.assertEqual(segmentation.settings.feature_spacing, 0.5)
-        with self.assertRaisesRegex(InputError, "not been chosen"):
-            MRFSettings().handcrafted  # noqa: B018 -- the property is the check
+        self.assertEqual((defaults.solver.tolerance, defaults.solver.max_iterations), (1e-4, 1000))
 
     def test_too_fine_an_image_extracts_on_a_grid_that_fits_in_memory(self):
         self.assertEqual(default_feature_spacing((100, 100, 100), (0.5, 0.5, 0.6), 16), 0.5)
@@ -119,8 +111,8 @@ class SettingsTest(unittest.TestCase):
         MRFSegmentation(volume, dataclasses.replace(FAST, feature_spacing=fits), stub_extractor).check_settings()  # no error
         self.assertIsNone(segmentation.features)  # nothing extracted
 
-    def test_a_grid_too_large_to_infer_in_is_refused_too(self):
-        from mrfseg.mrf import check_grid
+    def test_a_grid_too_large_to_solve_on_is_refused_too(self):
+        from mrfseg.rw import check_grid
 
         check_grid((100, 100, 100))
         with self.assertRaisesRegex(InputError, "coarser resampling spacing"):
@@ -130,10 +122,10 @@ class SettingsTest(unittest.TestCase):
         check_grids((512, 512, 400), (0.4, 0.4, 0.5), 0.5, 4)
         with self.assertRaisesRegex(InputError, r"use at least 0\.8 mm"):
             check_grids((512, 512, 400), (0.4, 0.4, 0.5), 0.2, 4)
-        # The features fit at 0.4 (3.6 GB for 4 features), but the inference does not until 0.8.
-        with self.assertRaisesRegex(InputError, r"to infer in.*use at least 0\.8 mm"):
+        # The features fit at 0.4 (3.6 GB for 4 features), but the solver does not until 0.8.
+        with self.assertRaisesRegex(InputError, r"to solve on.*use at least 0\.8 mm"):
             check_grids((512, 512, 400), (0.4, 0.4, 0.5), 0.4, 4)
-        self.assertGreater(MAX_MRF_BYTES, 1 << 30)
+        self.assertGreater(MAX_GRID_BYTES, 1 << 30)
 
 
 class GenerateSegmentationTest(unittest.TestCase):
@@ -144,6 +136,7 @@ class GenerateSegmentationTest(unittest.TestCase):
         cls.points, cls.labels = sphere_points(rotation_z(20))
         cls.segmentation = MRFSegmentation(cls.volume, FAST, stub_extractor)
         cls.result = cls.segmentation.generate_segmentation(cls.points, cls.labels)
+        cls.truth = np.linalg.norm(cls.world, axis=-1) <= 14.0
 
     def test_needs_a_volume_and_sensible_points(self):
         with self.assertRaises(ValueError):
@@ -163,8 +156,7 @@ class GenerateSegmentationTest(unittest.TestCase):
         for what, (points, labels) in bad.items():
             with self.subTest(what), self.assertRaises(InputError):
                 segmentation.generate_segmentation(points, labels)
-        # Inside points alone are fine: the image itself says what background looks like.
-        MRFSegmentation(self.volume, FAST, stub_extractor).generate_segmentation(self.points[:4], self.labels[:4])
+        self.assertTrue(segmentation.needs_inside_point())
 
     def test_bad_points_keep_the_last_segmentation(self):
         segmentation = MRFSegmentation(self.volume, FAST, stub_extractor)
@@ -173,8 +165,8 @@ class GenerateSegmentationTest(unittest.TestCase):
             segmentation.generate_segmentation(self.points[4:], self.labels[4:])
         self.assertIs(segmentation.last_segmentation, first)
 
-    def test_three_images_on_the_reference_grid(self):
-        for name in ("probability", "unary", "coupling"):
+    def test_two_images_on_the_reference_grid(self):
+        for name in ("probability", "affinity"):
             with self.subTest(name):
                 image = getattr(self.result, name)
                 self.assertIsNot(image, self.volume)
@@ -192,69 +184,77 @@ class GenerateSegmentationTest(unittest.TestCase):
 
     def test_segments_the_sphere(self):
         probability = voxels(self.result.probability)
-        truth = np.linalg.norm(self.world, axis=-1) <= 14.0
-        accuracy = ((probability > 0.5) == truth).mean()
+        accuracy = ((probability > 0.5) == self.truth).mean()
         self.assertGreater(accuracy, 0.95, accuracy)
-        self.assertGreater(probability[truth].mean(), 0.6)
-        self.assertLess(probability[~truth].mean(), 0.4)
+        self.assertGreater(probability[self.truth].mean(), 0.9)
+        self.assertLess(probability[~self.truth].mean(), 0.1)
         self.assertTrue((probability >= 0).all() and (probability <= 1).all())
 
-    def test_the_points_are_clamped(self):
+    def test_the_points_are_seeds(self):
         probability = voxels(self.result.probability)
         ijk = np.rint(Grid(self.volume).world_to_index(self.points)).astype(int)
         at_points = probability[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
-        # The clamped voxel is on the feature grid, read back onto the CT's grid between two of
+        # The seeded voxel is on the feature grid, read back onto the CT's grid between two of
         # its planes (the CT's 2.5 mm slices against the 2 mm grid): 1 and 0, but for that.
         np.testing.assert_allclose(at_points, (self.labels > 0).astype(float), atol=1e-2)
 
-    def test_the_coupling_is_cheap_across_the_sphere_s_wall(self):
-        coupling = voxels(self.result.coupling)
+    def test_the_affinity_is_low_across_the_sphere_s_wall(self):
+        affinity = voxels(self.result.affinity)
         radius = np.linalg.norm(self.world, axis=-1)
-        self.assertTrue((coupling >= 0).all())
-        self.assertLess(coupling[np.abs(radius - 14.0) < 2.0].mean(), coupling[radius < 8.0].mean())
-        self.assertAlmostEqual(float(coupling[radius < 8.0].mean()), FAST.coupling, delta=0.05)  # flat inside: lambda
+        self.assertLess(affinity[np.abs(radius - 14.0) < 2.0].mean(), affinity[radius < 8.0].mean() - 3.0)
+        self.assertAlmostEqual(float(affinity[radius < 8.0].mean()), 0.0, delta=0.05)  # flat inside: log 1
 
-    def test_the_unary_alone_is_the_evidence(self):
-        unary = voxels(self.result.unary)
-        truth = np.linalg.norm(self.world, axis=-1) <= 14.0
-        self.assertGreater(unary[truth].mean(), unary[~truth].mean() + 1.0)
-        # With no coupling the marginal is the unary's sigmoid, but at the clamped voxels. On an
-        # image whose grid is the feature grid, so that nothing is interpolated in between.
-        volume, _ = sphere_volume(spacing=(2.5, 2.5, 2.5))
-        points, labels = sphere_points()
-        without = MRFSegmentation(volume, dataclasses.replace(FAST, coupling=0.0, feature_spacing=2.5, connected=False), stub_extractor).generate_segmentation(points, labels)
-        probability, a = voxels(without.probability), voxels(without.unary)
-        ijk = np.rint(Grid(volume).world_to_index(points)).astype(int)
-        free = np.ones(probability.shape, dtype=bool)
-        free[ijk[:, 2], ijk[:, 1], ijk[:, 0]] = False
-        np.testing.assert_allclose(probability[free], 1 / (1 + np.exp(-a[free])), atol=2e-6)
-        np.testing.assert_allclose(probability[ijk[:, 2], ijk[:, 1], ijk[:, 0]], (labels > 0).astype(float), atol=1e-6)
-        self.assertEqual(without.inference.sweeps, 1)  # nothing changes after the first sweep
-
-    def test_reports_the_inference(self):
+    def test_reports_the_solve_and_the_seeds(self):
         inference = self.result.inference
-        self.assertLessEqual(inference.sweeps, FAST.sweeps)
-        self.assertGreater(inference.sweeps, 0)
-        self.assertTrue(np.isfinite(inference.delta))
-        self.assertEqual(inference.converged, inference.delta < 1e-3)
-        self.assertEqual(set(self.result.seconds), {"features", "potentials", "inference", "maps"})
+        self.assertLessEqual(inference.iterations, FAST.max_iterations)
+        self.assertTrue(inference.converged)
+        self.assertLessEqual(inference.residual, FAST.tolerance)
+        self.assertEqual(inference.components, 1)
+        self.assertEqual(inference.seeds, {"inside": 4, "outside": 6, "background": 0})  # nothing is below 0 HU
+        self.assertEqual(set(self.result.seconds), {"features", "affinities", "seeds", "solve", "maps"})
         stages = []
         MRFSegmentation(self.volume, FAST, stub_extractor).generate_segmentation(self.points, self.labels, stage=stages.append)
-        self.assertEqual(stages, ["features", "potentials", "inference", "maps"])
+        self.assertEqual(stages, ["features", "affinities", "seeds", "solve", "maps"])
 
-    def test_more_coupling_smooths(self):
-        rough = voxels(MRFSegmentation(self.volume, dataclasses.replace(FAST, coupling=0.0), stub_extractor).generate_segmentation(self.points, self.labels).probability)
-        smooth = voxels(MRFSegmentation(self.volume, dataclasses.replace(FAST, coupling=3.0), stub_extractor).generate_segmentation(self.points, self.labels).probability)
-        variation = lambda p: float(np.abs(np.diff(p, axis=2)).mean() + np.abs(np.diff(p, axis=1)).mean() + np.abs(np.diff(p, axis=0)).mean())  # noqa: E731
-        self.assertLess(variation(smooth), variation(rough))
+    def test_background_seeds_stand_in_for_outside_points(self):
+        # With the threshold above the background's 0 HU, the background seeds itself, and the
+        # inside points alone segment the sphere.
+        seeded = dataclasses.replace(FAST, seed_hu=50.0)
+        result = MRFSegmentation(self.volume, seeded, stub_extractor).generate_segmentation(self.points[:4], self.labels[:4])
+        self.assertGreater(result.inference.seeds["background"], 1000)
+        self.assertGreater(((voxels(result.probability) > 0.5) == self.truth).mean(), 0.95)
+        # Eroded: the voxels next to the sphere are not seeds, and more erosion seeds fewer.
+        more = MRFSegmentation(self.volume, dataclasses.replace(seeded, seed_erosion=3), stub_extractor).generate_segmentation(self.points[:4], self.labels[:4])
+        self.assertLess(more.inference.seeds["background"], result.inference.seeds["background"])
+        # Off: inside points alone leave the whole image at 1 (only the sink pulls down).
+        off = MRFSegmentation(self.volume, dataclasses.replace(FAST, background_seeds=False), stub_extractor).generate_segmentation(self.points[:4], self.labels[:4])
+        self.assertEqual(off.inference.seeds["background"], 0)
+        self.assertGreater(voxels(off.probability).min(), 0.9)
 
-    def test_features_are_extracted_once_per_spacing(self):
+    def test_an_outside_point_only_lowers_the_probability(self):
+        """The comparison principle, end to end."""
+        more = MRFSegmentation(self.volume, FAST, stub_extractor).generate_segmentation(
+            np.vstack([self.points, [[0.0, 0.0, 10.0]]]), np.append(self.labels, -1))  # an outside point inside the sphere
+        p, q = voxels(self.result.probability), voxels(more.probability)
+        self.assertTrue(bool((q <= p + 1e-5).all()))
+        self.assertLess(q[self.truth].mean(), p[self.truth].mean() - 0.1)
+
+    def test_the_contrast_setting_changes_the_affinities(self):
+        soft = MRFSegmentation(self.volume, dataclasses.replace(FAST, contrast=10000.0), stub_extractor).generate_segmentation(self.points, self.labels)
+        # With a contrast scale far above any step the graph is uniform: the probability blurs
+        # out of the sphere, and the affinity map is flat.
+        self.assertLess(((voxels(soft.probability) > 0.5) == self.truth).mean(), 0.9)
+        self.assertAlmostEqual(float(np.abs(voxels(soft.affinity)).max()), 0.0, places=3)
+
+    def test_features_are_extracted_once_per_spacing_and_the_solve_restarts_from_the_last(self):
         counting = StubExtractor()
         segmentation = MRFSegmentation(self.volume, FAST, counting)
-        segmentation.generate_segmentation(self.points, self.labels)
+        first = segmentation.generate_segmentation(self.points, self.labels)
         again = segmentation.generate_segmentation(self.points, self.labels)
         self.assertEqual(len(counting.shapes), 1)
         self.assertEqual(again.seconds["features"], 0.0)
+        self.assertLess(again.inference.iterations, first.inference.iterations)  # from the last probability: nothing to do
+        np.testing.assert_allclose(voxels(again.probability), voxels(first.probability), atol=1e-3)
         segmentation.settings = dataclasses.replace(FAST, feature_spacing=3.0)
         segmentation.generate_segmentation(self.points, self.labels)
         self.assertEqual(len(counting.shapes), 2)
@@ -298,10 +298,7 @@ class GenerateSegmentationTest(unittest.TestCase):
         self.assertLess(abs(np.linalg.norm(a, axis=1).mean() - 14.0), 3.0)
         normals = vtk_to_numpy(half.GetPointData().GetNormals())
         self.assertGreater(np.einsum("ij,ij->i", normals, a / np.linalg.norm(a, axis=1, keepdims=True)).mean(), 0.8)
-        # The unary's zero level is the evidence alone, before the coupling.
-        unary = self.segmentation.extract_surface("unary")
-        self.assertGreater(unary.GetNumberOfPolys(), 100)
-        for bad in [("probability", 1.5), ("probability", 0.0), ("contour", None), ("unary", "high")]:
+        for bad in [("probability", 1.5), ("probability", 0.0), ("contour", None), ("unary", None), ("affinity", 0.0)]:
             with self.subTest(bad), self.assertRaises(ValueError):
                 self.segmentation.extract_surface(*bad)
 
@@ -318,38 +315,10 @@ class GenerateSegmentationTest(unittest.TestCase):
         strict = voxels(self.segmentation.labelmap(0.8))
         np.testing.assert_array_equal(strict, (probability >= 0.8).astype(np.uint8))
         self.assertTrue((strict <= labels).all())
-        truth = np.linalg.norm(self.world, axis=-1) <= 14.0
-        self.assertGreater((labels.astype(bool) == truth).mean(), 0.95)
+        self.assertGreater((labels.astype(bool) == self.truth).mean(), 0.95)
         for bad in (0.0, 1.0, -0.2):
             with self.subTest(bad), self.assertRaises(ValueError):
                 self.segmentation.labelmap(bad)
-
-    def test_connected_keeps_what_the_inside_points_reach(self):
-        from mrfseg.mrf import Clamps
-        from mrfseg.segmentation import select_connected
-
-        # Two blobs; an inside clamp in one of them.
-        marginal = torch.zeros((6, 6, 12))
-        marginal[1:4, 1:4, 1:4] = 0.9
-        marginal[1:4, 1:4, 8:11] = 0.8
-        marginal[0, 0, 0] = 0.3  # below the threshold: never a component
-        clamps = Clamps.from_voxels(np.array([[2, 2, 2]]), np.array([1]), (6, 6, 12), torch.device("cpu"))
-        kept = select_connected(marginal, clamps)
-        self.assertEqual(kept, 1)
-        self.assertAlmostEqual(float(marginal[2, 2, 2]), 0.9, places=6)
-        self.assertEqual(float(marginal[2, 2, 9]), 0.0)  # the other blob is gone
-        self.assertAlmostEqual(float(marginal[0, 0, 0]), 0.3, places=6)  # below the threshold, left alone
-        # Without inside clamps nothing is dropped.
-        marginal = torch.full((3, 3, 3), 0.7)
-        self.assertIsNone(select_connected(marginal, Clamps.from_voxels(np.array([[0, 0, 0]]), np.array([-1]), (3, 3, 3), torch.device("cpu"))))
-        self.assertAlmostEqual(float(marginal.min()), 0.7, places=6)
-        # End to end: the rule is on by default and the inside points are in the sphere, so it changes nothing there...
-        self.assertTrue(FAST.connected)
-        self.assertEqual(self.result.inference.components, 1)
-        without = MRFSegmentation(self.volume, dataclasses.replace(FAST, connected=False), stub_extractor).generate_segmentation(self.points, self.labels)
-        self.assertIsNone(without.inference.components)
-        np.testing.assert_allclose(voxels(without.probability) >= 0.5, voxels(self.result.probability) >= 0.5)
-        # ...and with outside points only in Learned-like use (no inside point) it is not applied.
 
 
 class OddImagesTest(unittest.TestCase):

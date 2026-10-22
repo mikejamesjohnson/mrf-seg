@@ -9,7 +9,7 @@ import { freshStorePerTest, openImage } from "./helpers";
 freshStorePerTest();
 const store = () => useSceneStore.getState();
 
-const inference = { sweeps: 10, delta: 0.0001, converged: true, components: 1 };
+const inference = { iterations: 12, residual: 0.00005, converged: true, components: 1, seeds: { inside: 1, outside: 1, background: 0 } };
 
 /** The store with an image, an inside and an outside point, a session, and a segmentation generated from all of that. */
 function generated(): GeneratedSegmentation {
@@ -24,7 +24,7 @@ function generated(): GeneratedSegmentation {
     pointsVersion: store().pointsVersion,
     settings: store().segmentation.settings,
     sessionId: "s1",
-    seconds: { features: 0, potentials: 0, inference: 0, maps: 0 },
+    seconds: { features: 0, affinities: 0, seeds: 0, solve: 0, maps: 0 },
     inference,
   };
   store().setSegmentation({ generated: made, generation: 1 });
@@ -32,7 +32,7 @@ function generated(): GeneratedSegmentation {
 }
 
 describe("the segmentation state", () => {
-  it("knows when there is anything to segment from: an inside point, unless the network needs none", () => {
+  it("knows when there is anything to segment from: an inside point, whichever the extractor", () => {
     openImage([10, 10, 10], [1, 1, 1], [0, 0, 0]);
     expect(enoughPoints(store())).toBe(false);
     store().setPlaceMode("outside");
@@ -44,7 +44,7 @@ describe("the segmentation state", () => {
     store().removePoints([2]);
     expect(enoughPoints(store())).toBe(false);
     store().setSegmentationSettings({ featureExtractor: "learned" });
-    expect(enoughPoints(store())).toBe(true); // the network segments with no points at all
+    expect(enoughPoints(store())).toBe(false); // the walker needs a seed to carry, whatever the affinities
   });
 
   it("is busy while a Generate or any build runs", () => {
@@ -67,7 +67,7 @@ describe("the segmentation state", () => {
     store().setPlaceMode("outside");
     store().addPoint([5, 5, 5]);
     expect(staleReasons(store())).toEqual(["the points have changed"]);
-    store().setSegmentationSettings({ connected: false });
+    store().setSegmentationSettings({ backgroundSeeds: false });
     store().setSegmentation({ sessionId: "s2" });
     expect(staleReasons(store())).toEqual(["the points have changed", "the settings have changed", "the backend session is new, and has no segmentation yet"]);
     expect(segmentationIsStale(store())).toBe(true);
@@ -76,7 +76,7 @@ describe("the segmentation state", () => {
 
   it("counts any setting as a change to the segmentation", () => {
     generated();
-    store().setSegmentationSettings({ spatialLengthscale: 12 });
+    store().setSegmentationSettings({ seedHu: 12 });
     expect(staleReasons(store())).toEqual(["the settings have changed"]);
   });
 
@@ -90,13 +90,13 @@ describe("the segmentation state", () => {
 
   it("lets a new image choose the grid, but keeps a value the extractor brought", () => {
     openImage([10, 10, 10], [1, 1, 1], [0, 0, 0]);
-    store().setExtractors({ learned: { available: true, settings: { sweeps: 20, coupling: 1, unaryShift: 0, spatialLengthscale: 10 }, nativeSpacing: 0.5, note: null } });
-    store().setSegmentationSettings({ featureExtractor: "basic", featureSpacing: 2, spatialLengthscale: 40 });
+    store().setExtractors({ learned: { available: true, settings: { affinityScale: 1.5, featureSpacing: 0.5 }, nativeSpacing: 0.5, note: null } });
+    store().setSegmentationSettings({ featureExtractor: "basic", featureSpacing: 2, affinityScale: 2 });
     store().resetSegmentation("another");
-    expect([store().segmentation.settings.featureSpacing, store().segmentation.settings.spatialLengthscale]).toEqual([null, null]); // Basic: both the image's to choose
-    store().setSegmentationSettings({ featureExtractor: "learned", featureSpacing: 0.5, spatialLengthscale: 10 });
+    expect([store().segmentation.settings.featureSpacing, store().segmentation.settings.affinityScale]).toEqual([null, 2]); // Basic: the grid is the image's to choose
+    store().setSegmentationSettings({ featureExtractor: "learned", featureSpacing: 0.5, affinityScale: 1.5 });
     store().resetSegmentation("yet-another");
-    expect([store().segmentation.settings.featureSpacing, store().segmentation.settings.spatialLengthscale]).toEqual([null, 10]); // Learned: l_s is the checkpoint's
+    expect([store().segmentation.settings.featureSpacing, store().segmentation.settings.affinityScale]).toEqual([0.5, 1.5]); // Learned: the checkpoint's grid stays
   });
 
   it("does not count a Generate made before the session chose the image's settings as current", () => {
@@ -118,8 +118,7 @@ describe("the segmentation state", () => {
     expect(needsGenerate(store())).toBe(true); // nothing generated yet
   });
 
-  it("builds a surface at a = 0, or at the probability threshold", () => {
-    expect(surfaceLevel({ source: "unary", threshold: 0.7 })).toBe(0);
+  it("builds a surface at the probability threshold", () => {
     expect(surfaceLevel({ source: "probability", threshold: 0.7 })).toBe(0.7);
   });
 
@@ -132,9 +131,9 @@ describe("the segmentation state", () => {
     store().setProduct("labelmap", { threshold: 0.6 });
     expect(productStale(store(), "labelmap")).toBe(true);
     store().setProduct("labelmap", { threshold: 0.5 });
-    store().setProduct("surface", { source: "unary" });
+    store().setProduct("surface", { threshold: 0.6 });
     expect(productStale(store(), "surface")).toBe(true);
-    store().setProduct("surface", { source: "probability" });
+    store().setProduct("surface", { threshold: 0.5 });
     store().setSegmentation({ generation: 2 });
     expect([productStale(store(), "labelmap"), productStale(store(), "surface")]).toEqual([true, true]);
   });

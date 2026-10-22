@@ -1,4 +1,4 @@
-/** Generate: build the CRF's potentials from the labelled points, infer the marginals with the points clamped, and store the three maps. */
+/** Generate: seed the walker with the labelled points, solve it on the affinities, and store the two maps. */
 
 import { imageOnGrid } from "@/lib/io/loaders";
 import { currentImage, onGridOf, voxelCount } from "@/lib/scene/datasets";

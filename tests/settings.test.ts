@@ -41,12 +41,10 @@ function backendTuple(file: string, name: string): string[] {
   return [...match[1].matchAll(/"(\w+)"/g)].map(([, word]) => word);
 }
 
-/** `BOUNDS` from `settings.py`: each setting's (low, high), with `MAX_SCALES` read from `basic.py`. */
+/** `BOUNDS` from `settings.py`: each setting's (low, high). */
 function backendBounds(): Record<string, [number, number]> {
-  const constants: Record<string, number> = { MAX_SCALES: Number(/^MAX_SCALES = (\d+)$/m.exec(python("basic.py"))?.[1]) };
   const body = python("settings.py").split(/^BOUNDS[^\n]*\n/m)[1].split(/^}/m)[0];
-  const number = (text: string) => (text in constants ? constants[text] : Number(text));
-  return Object.fromEntries([...body.matchAll(/^ {4}"(\w+)": \(([^,]+), ([^)]+)\),$/gm)].map(([, name, low, high]) => [name, [number(low), number(high)]]));
+  return Object.fromEntries([...body.matchAll(/^ {4}"(\w+)": \(([^,]+), ([^)]+)\),$/gm)].map(([, name, low, high]) => [name, [Number(low), Number(high)]]));
 }
 
 describe("MRF settings", () => {
@@ -75,18 +73,18 @@ describe("MRF settings", () => {
     }
   });
 
-  it("group the potentials and the inference as the backend's model does", () => {
-    expect(settingGroup("Unary potential").fields.map((field) => field.key)).toEqual(["featureLengthscale", "spatialLengthscale", "priorLogit", "unaryScale", "unaryShift"]);
-    expect(settingGroup("Pairwise potential").fields.map((field) => field.key)).toEqual(["coupling", "contrast", "couplingFloor"]);
-    expect(settingGroup("Inference").fields.map((field) => field.key)).toEqual(["sweeps", "connected"]);
-    const potentials = [...settingGroup("Unary potential").fields, ...settingGroup("Pairwise potential").fields, ...settingGroup("Inference").fields].map((field) => field.key);
-    expect([...POTENTIAL_KEYS].sort()).toEqual([...potentials].sort());
+  it("group the affinities, the seeds and the solver as the backend's model does", () => {
+    expect(settingGroup("Affinities").fields.map((field) => field.key)).toEqual(["featureExtractor", "featureSpacing", "contrast", "affinityScale", "device"]);
+    expect(settingGroup("Seeds").fields.map((field) => field.key)).toEqual(["backgroundSeeds", "seedHu", "seedErosion"]);
+    expect(settingGroup("Solver").fields.map((field) => field.key)).toEqual(["tolerance", "maxIterations", "preconditioner"]);
+    const own = [...settingGroup("Affinities").fields.filter((field) => !["featureExtractor", "featureSpacing", "device"].includes(field.key)), ...settingGroup("Seeds").fields, ...settingGroup("Solver").fields].map((field) => field.key);
+    expect([...POTENTIAL_KEYS].sort()).toEqual([...own].sort());
   });
 
   it("start from an extractor's own settings over the defaults, or from the defaults alone", () => {
-    const trained = { available: true, settings: { sweeps: 20, coupling: 1, unaryShift: 0 } as Partial<MRFSettings>, nativeSpacing: 0.5, note: "/x/best.pt" };
+    const trained = { available: true, settings: { affinityScale: 1 } as Partial<MRFSettings>, nativeSpacing: 0.5, note: "/x/best.pt" };
     const defaults = Object.fromEntries(POTENTIAL_KEYS.map((key) => [key, DEFAULT_MRF_SETTINGS[key]]));
-    expect(settingsForExtractor("learned", trained)).toEqual({ featureExtractor: "learned", featureSpacing: null, ...defaults, sweeps: 20, coupling: 1, unaryShift: 0 });
+    expect(settingsForExtractor("learned", trained)).toEqual({ featureExtractor: "learned", featureSpacing: null, ...defaults, affinityScale: 1 });
     expect(settingsForExtractor("basic", { available: true, settings: null, nativeSpacing: null, note: null })).toEqual({ featureExtractor: "basic", featureSpacing: null, ...defaults });
     expect(settingsForExtractor("basic", undefined)).toEqual({ featureExtractor: "basic", featureSpacing: null, ...defaults });
   });
@@ -100,27 +98,28 @@ describe("MRF settings", () => {
     const names = Object.keys(EXTRACTOR_LABELS).sort();
     const backend = [...python("extractors.py").matchAll(/^ {4}"(\w+)": ExtractorSpec\(/gm)].map(([, name]) => name);
     expect(names).toEqual([...backend].sort());
-    const features = settingGroup("Feature extraction");
-    const extractor = features.fields.find((field) => field.key === "featureExtractor");
+    const affinities = settingGroup("Affinities");
+    const extractor = affinities.fields.find((field) => field.key === "featureExtractor");
     expect(extractor?.kind === "choice" && extractor.options.map((option) => option.value).sort()).toEqual(names);
-    const basicOnly = features.fields.filter((field) => field.key.startsWith("basic")).map((field) => field.key);
-    expect(basicOnly.length).toBeGreaterThan(0);
     const shown = (group: string, featureExtractor: "basic" | "learned") => shownFields(settingGroup(group), { ...DEFAULT_MRF_SETTINGS, featureExtractor }).map((field) => field.key);
-    expect(shown("Feature extraction", "basic")).toEqual(expect.arrayContaining(basicOnly));
-    expect(shown("Feature extraction", "learned").filter((key) => basicOnly.includes(key))).toEqual([]);
-    // The handcrafted unary's knobs for Basic, the network's shift for Learned; the coupling for both.
-    expect(shown("Unary potential", "basic")).toEqual(["featureLengthscale", "spatialLengthscale", "priorLogit", "unaryScale"]);
-    expect(shown("Unary potential", "learned")).toEqual(["unaryShift"]);
-    expect(shown("Pairwise potential", "basic")).toEqual(["coupling", "contrast", "couplingFloor"]);
-    expect(shown("Pairwise potential", "learned")).toEqual(["coupling"]);
+    // The contrast scale for Basic, the network's scale for Learned.
+    expect(shown("Affinities", "basic")).toEqual(["featureExtractor", "featureSpacing", "contrast", "device"]);
+    expect(shown("Affinities", "learned")).toEqual(["featureExtractor", "featureSpacing", "affinityScale", "device"]);
+    // The background seeds' threshold and erosion only while they are on.
+    expect(shown("Seeds", "basic")).toEqual(["backgroundSeeds", "seedHu", "seedErosion"]);
+    expect(shownFields(settingGroup("Seeds"), { ...DEFAULT_MRF_SETTINGS, backgroundSeeds: false }).map((field) => field.key)).toEqual(["backgroundSeeds"]);
   });
 
-  it("know which extractor needs an inside point, as the backend's table says", () => {
-    const table = python("extractors.py");
-    const learnedEntry = table.split(/^ {4}"learned": ExtractorSpec\(/m)[1].split(/^ {4}\),/m)[0];
-    expect(learnedEntry).toContain("needs_inside_point=False");
-    expect(needsInsidePoint("learned")).toBe(false);
+  it("know that every extractor needs an inside point, as the backend does", () => {
+    const segmentation = python("segmentation.py").split(/def needs_inside_point/)[1].split(/\n    def /)[0];
+    expect(segmentation).toContain("return True");
+    expect(needsInsidePoint("learned")).toBe(true);
     expect(needsInsidePoint("basic")).toBe(true);
+  });
+
+  it("offer the backend's preconditioners", () => {
+    const field = settingGroup("Solver").fields.find((candidate) => candidate.key === "preconditioner");
+    expect(field?.kind === "choice" && field.options.map((option) => option.value)).toEqual(backendTuple("rw.py", "PRECONDITIONERS"));
   });
 });
 

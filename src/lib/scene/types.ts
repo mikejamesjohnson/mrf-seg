@@ -47,7 +47,7 @@ export interface ImageDataset extends DatasetCommon, GridInfo {
 }
 
 /** What a segmentation produces on its image's grid; each is described in `segmentation/maps.ts`. */
-export type MapQuantity = "unary" | "coupling" | "probability";
+export type MapQuantity = "affinity" | "probability";
 
 /**
  * A map computed on an image's grid by the backend, replaced in place (same id, next
@@ -75,15 +75,15 @@ export interface LabelmapDataset extends DatasetCommon, GridInfo {
   voxels: number;
 }
 
-/** Which map a surface is an isosurface of. */
-export type SurfaceSource = "probability" | "unary";
+/** Which map a surface is an isosurface of: the probability (the affinity has no level worth a surface). */
+export type SurfaceSource = "probability";
 
 /** A segmentation's boundary as a triangle mesh, built by the backend. */
 export interface MeshDataset extends DatasetCommon {
   kind: "mesh";
   sourceId: DatasetId;
   source: SurfaceSource;
-  /** The isovalue: the threshold for the probability, 0 for the unary logit. */
+  /** The isovalue: the probability threshold. */
   level: number;
   points: number;
   triangles: number;

@@ -14,7 +14,7 @@ describe("drawsDifferently", () => {
   it("ignores a store change no pane draws from", () => {
     openImage([10, 10, 10], [1, 1, 1], [0, 0, 0]);
     const before = store();
-    store().setSegmentation({ job: { state: "running", stage: "inference", progress: 0.5 } });
+    store().setSegmentation({ job: { state: "running", stage: "solve", progress: 0.5 } });
     for (const role of ["red", "yellow", "green", "3d"] as const) expect(drawsDifferently(role, store(), before), role).toBe(false);
   });
 

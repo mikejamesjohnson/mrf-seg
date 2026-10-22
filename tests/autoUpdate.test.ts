@@ -29,7 +29,7 @@ vi.mock("@/lib/segmentation/generate", async () => ({
       scene.getState().setSegmentation({ job: { state: "done", progress: 1 } });
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    const inference = { sweeps: 10, delta: 0.0001, converged: true, components: null };
+    const inference = { iterations: 12, residual: 0.00005, converged: true, components: 1, seeds: { inside: 1, outside: 1, background: 0 } };
     scene.getState().setSegmentation({
       job: { state: "done", progress: 1 },
       generation: scene.getState().segmentation.generation + 1,
@@ -38,7 +38,7 @@ vi.mock("@/lib/segmentation/generate", async () => ({
         pointsVersion,
         settings: segmentation.settings,
         sessionId: segmentation.sessionId ?? SESSION,
-        seconds: { features: 0, potentials: 0, inference: 0, maps: 0 },
+        seconds: { features: 0, affinities: 0, seeds: 0, solve: 0, maps: 0 },
         inference,
       },
     });
@@ -146,10 +146,10 @@ describe("auto update", () => {
 
   it("runs when a setting changes", async () => {
     await upToDate();
-    store().setSegmentationSettings({ sweeps: 300 });
+    store().setSegmentationSettings({ maxIterations: 300 });
     await finish();
     expect(steps.ran).toEqual(["generate 2", "labelmap", "surface"]);
-    store().setSegmentationSettings({ coupling: 2 });
+    store().setSegmentationSettings({ contrast: 60 });
     await finish();
     expect(steps.ran).toEqual(["generate 2", "labelmap", "surface", "generate 2", "labelmap", "surface"]);
   });
@@ -158,17 +158,15 @@ describe("auto update", () => {
     await upToDate();
     store().setProduct("labelmap", { threshold: 0.7 });
     await finish();
-    store().setProduct("surface", { source: "unary" });
+    store().setProduct("surface", { threshold: 0.6 });
     await finish();
-    store().setProduct("surface", { source: "probability", threshold: 0.6 });
-    await finish();
-    expect(steps.ran).toEqual(["labelmap", "surface", "surface"]);
+    expect(steps.ran).toEqual(["labelmap", "surface"]);
   });
 
   it("builds only what is ticked, and a product once it is ticked", async () => {
     await upToDate();
     store().setAutoUpdate({ surface: false });
-    store().setSegmentationSettings({ sweeps: 200 });
+    store().setSegmentationSettings({ maxIterations: 200 });
     await finish();
     expect(steps.ran).toEqual(["generate 2", "labelmap"]);
     store().setAutoUpdate({ surface: true }); // out of date: built from the segmentation before
@@ -191,7 +189,7 @@ describe("auto update", () => {
     await tick();
     add("outside", 3);
     add("outside", 4);
-    store().setSegmentationSettings({ sweeps: 250 });
+    store().setSegmentationSettings({ maxIterations: 250 });
     await finish();
     expect(steps.ran).toEqual(["generate 3", "generate 5", "labelmap", "surface"]);
   });
@@ -234,7 +232,7 @@ describe("auto update", () => {
     await finish();
     expect(steps.ran).toEqual([]);
     steps.fail = false;
-    store().setSegmentationSettings({ sweeps: 100 });
+    store().setSegmentationSettings({ maxIterations: 100 });
     await finish();
     expect(steps.ran).toEqual(["generate 2", "labelmap", "surface"]);
 

@@ -25,30 +25,22 @@ const peakOf = ([low, high]: [number, number]) => Math.max(Math.abs(low), Math.a
 export const MAP_DISPLAY: Record<MapQuantity, MapDisplay> = {
   probability: {
     label: "Probability",
-    meaning: "p(y = 1)",
+    meaning: "p: reaching an inside point first",
     compact: Uint8Array,
     firstOverlay: { colorMap: "jet", visible: true, opacity: 0.5 },
     span: () => [0, 1],
     legend: () => ["0", "1"],
   },
-  unary: {
-    label: "Unary logit",
-    meaning: "a",
+  affinity: {
+    label: "Affinity",
+    meaning: "mean log w at the voxel",
     compact: Int16Array,
     firstOverlay: { colorMap: "diverging", visible: false, opacity: 0.5 },
-    // Symmetric about zero, where the evidence alone is undecided.
+    // Symmetric about zero, the affinity of 1: positive flows, negative holds back.
     span: (range) => [-peakOf(range), peakOf(range)],
-    legend: ([low, high]) => [`${low.toFixed(1)} outside`, `inside +${high.toFixed(1)}`],
-  },
-  coupling: {
-    label: "Coupling",
-    meaning: "mean w",
-    compact: Int16Array,
-    firstOverlay: { colorMap: "sequential", visible: false, opacity: 0.5 },
-    span: (range) => [0, peakOf(range)],
-    legend: ([, high]) => ["0 (free to change)", high.toFixed(2)],
+    legend: ([low, high]) => [`${low.toFixed(1)} wall`, `flows +${high.toFixed(1)}`],
   },
 };
 
 /** In the order the backend lists them and the panel shows them. */
-export const MAP_QUANTITIES = ["unary", "coupling", "probability"] as const satisfies readonly MapQuantity[];
+export const MAP_QUANTITIES = ["affinity", "probability"] as const satisfies readonly MapQuantity[];

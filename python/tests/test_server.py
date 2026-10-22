@@ -19,8 +19,8 @@ from mrfseg.server.app import MAX_SESSIONS
 from mrfseg.server.encoding import mesh_bytes
 from tests.helpers import sphere_points, sphere_volume, stub_extractor, write_metaimage
 
-# As `tests.test_segmentation.FAST`: the sphere is not the rare structure the handcrafted unary expects.
-SETTINGS = {"feature_spacing": 2.0, "device": "cpu", "spatial_lengthscale": 15.0, "prior_logit": 2.0, "feature_lengthscale": 1.0, "sweeps": 50}
+# As `tests.test_segmentation.FAST`: the contrast affinities on the test sphere, the outside points as seeds.
+SETTINGS = {"feature_spacing": 2.0, "device": "cpu"}
 
 
 class ServerTest(unittest.TestCase):
@@ -98,7 +98,7 @@ class ServerTest(unittest.TestCase):
     def test_session_reads_the_image_and_extracts_its_features(self):
         opened = self.open_session()
         self.assertEqual(opened["geometry"]["dimensions"], [24, 22, 18])
-        self.assertEqual((opened["settings"]["feature_spacing"], opened["settings"]["spatial_lengthscale"]), (2.0, 15.0))
+        self.assertEqual((opened["settings"]["feature_spacing"], opened["settings"]["contrast"]), (2.0, 40.0))
         features = self.wait(opened["id"], "features")
         self.assertEqual(features["state"], "done", features)
         self.assertEqual((features["result"]["channels"], features["result"]["spacing"], features["result"]["extractor"]), (3, 2.0, "basic"))
@@ -106,12 +106,12 @@ class ServerTest(unittest.TestCase):
 
     def test_a_session_left_to_the_image_says_what_it_chose(self):
         # The test image's voxels are 2 x 2 x 2.5 mm.
-        status, _, data = self.call("POST", "/sessions", {"path": str(self.image_path), "settings": {"device": "cpu", "feature_spacing": None, "spatial_lengthscale": None}})
+        status, _, data = self.call("POST", "/sessions", {"path": str(self.image_path), "settings": {"device": "cpu", "feature_spacing": None}})
         self.assertEqual(status, 201, data)
         settings = json.loads(data)["settings"]
-        self.assertEqual((settings["feature_spacing"], settings["spatial_lengthscale"], settings["sweeps"]), (2.0, 50.0, 50))
+        self.assertEqual((settings["feature_spacing"], settings["max_iterations"], settings["background_seeds"]), (2.0, 1000, True))
 
-    def test_generate_then_fetch_the_three_maps(self):
+    def test_generate_then_fetch_the_two_maps(self):
         session = self.open_session()["id"]
         self.assertEqual(self.call("GET", f"/sessions/{session}/segmentation/probability")[0], 409)
         status, body = self.segment(session)
@@ -120,15 +120,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(job["state"], "done", job)
         result = job["result"]
         self.assertEqual(result["points"], 10)
-        self.assertEqual(set(result["maps"]), {"unary", "coupling", "probability"})
-        self.assertEqual(set(result["inference"]), {"sweeps", "delta", "converged", "components"})
-        self.assertEqual(set(result["seconds"]), {"features", "potentials", "inference", "maps"})
+        self.assertEqual(set(result["maps"]), {"affinity", "probability"})
+        self.assertEqual(set(result["inference"]), {"iterations", "residual", "converged", "components", "seeds"})
+        self.assertEqual(result["inference"]["seeds"], {"inside": 4, "outside": 6, "background": 0})
+        self.assertEqual(set(result["seconds"]), {"features", "affinities", "seeds", "solve", "maps"})
 
         points, labels = self.points()
         expected = MRFSegmentation(read_image(self.image_path), MRFSettings(**SETTINGS), stub_extractor).generate_segmentation(
             np.array(points), np.array(labels)
         )
-        for name, dtype in (("unary", "<i2"), ("coupling", "<i2"), ("probability", "u1")):
+        for name, dtype in (("affinity", "<i2"), ("probability", "u1")):
             with self.subTest(name):
                 status, content_type, data = self.call("GET", f"/sessions/{session}/segmentation/{name}")
                 self.assertEqual((status, content_type), (200, "application/octet-stream"))
@@ -152,7 +153,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual((described["basic"]["available"], described["basic"]["settings"]), (True, None))
         learned = described["learned"]
         if learned["available"]:  # a checkpoint on this machine: the settings to start from, by their names
-            self.assertEqual(set(learned["settings"]), {"sweeps", "coupling", "unary_shift"})
+            self.assertEqual(set(learned["settings"]), {"affinity_scale"})
             self.assertEqual(learned["native_spacing"], 0.5)
         else:
             self.assertIn("checkpoint", learned["note"])
@@ -181,7 +182,7 @@ class ServerTest(unittest.TestCase):
         # The last result, and what was built from it, are still there.
         self.assertEqual(self.call("GET", f"/sessions/{session}/segmentation/probability")[0], 200)
         self.assertEqual(self.call("GET", f"/sessions/{session}/labelmap")[0], 200)
-        self.assertEqual(self.call("POST", f"/sessions/{session}/surface", {"source": "unary"})[0], 200)
+        self.assertEqual(self.call("POST", f"/sessions/{session}/surface", {"source": "probability", "level": 0.3})[0], 200)
         # Once a Generate succeeds, the features report follows the new grid.
         self.segment(session, settings={**SETTINGS, "feature_spacing": 3.0})
         self.assertEqual(self.wait(session, "job")["state"], "done")
@@ -234,7 +235,7 @@ class ServerTest(unittest.TestCase):
             ("POST", "/sessions", {"path": "relative/ct.mha"}, 400),
             ("POST", "/sessions", {"path": str(self.image_path.with_name("missing.mha"))}, 400),
             ("POST", "/sessions", {"path": str(self.image_path), "settings": {"colour": "blue"}}, 400),
-            ("POST", "/sessions", {"path": str(self.image_path), "settings": {"sweeps": -1}}, 400),
+            ("POST", "/sessions", {"path": str(self.image_path), "settings": {"max_iterations": -1}}, 400),
             ("POST", f"/sessions/{session}/segmentation", {"points": [[0, 0]], "labels": [1]}, 400),
             ("POST", f"/sessions/{session}/segmentation", {"points": [[0, 0, 0]], "labels": [1, -1]}, 400),
             ("POST", "/sessions/nope/segmentation", {"points": [], "labels": []}, 404),
@@ -271,7 +272,7 @@ class ServerTest(unittest.TestCase):
             with self.subTest(what):
                 status, data = self.segment(session, bad_points, bad_labels)
                 self.assertEqual(status, 400, data)
-        for settings in ({"basic_edges": "false"}, {"sweeps": True}, {"coupling": 1e400}, {"sweeps": 10**400}, []):
+        for settings in ({"background_seeds": "false"}, {"max_iterations": True}, {"contrast": 1e400}, {"max_iterations": 10**400}, []):
             with self.subTest(settings=settings):
                 self.assertEqual(self.segment(session, points, labels, settings=settings)[0], 400)
 

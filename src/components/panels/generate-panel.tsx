@@ -18,8 +18,9 @@ import { OVERLAY_RAMPS, rampGradient } from "@/lib/viewer/colorRamp";
 const STAGES: Record<TaskStage, string> = {
   queued: "Waiting",
   features: "Extracting features",
-  potentials: "Building the potentials",
-  inference: "Mean-field sweeps",
+  affinities: "Building the affinities",
+  seeds: "Seeding",
+  solve: "Solving the walker",
   maps: "Fetching the maps",
 };
 
@@ -32,8 +33,8 @@ export function stageText(task: TaskProgress, features: TaskProgress): string {
 }
 
 /**
- * The pipeline's three outputs, each a button with an Auto box: the segmentation (the CRF's
- * marginals at every voxel, with the settings as they are), and the labelmap and surface built
+ * The pipeline's three outputs, each a button with an Auto box: the segmentation (the walker's
+ * probability at every voxel, with the settings as they are), and the labelmap and surface built
  * from it. Each step's own settings and display options sit under its button.
  */
 export function GeneratePanel() {
@@ -77,10 +78,16 @@ function Segmentation() {
           {generated && (
             <div className="space-y-0.5">
               <Hint>
-                From {generated.points} points with the settings above: potentials {generated.seconds.potentials.toFixed(1)} s, inference{" "}
-                {generated.seconds.inference.toFixed(1)} s ({generated.inference.sweeps} sweeps{generated.inference.converged ? "" : ", not converged"})
+                From {generated.points} points with the settings above: solved in {generated.seconds.solve.toFixed(1)} s ({generated.inference.iterations}{" "}
+                iterations{generated.inference.converged ? "" : ", not converged"}; {generated.inference.components}{" "}
+                {generated.inference.components === 1 ? "piece" : "pieces"} from {generated.inference.seeds.inside} inside{" "}
+                {generated.inference.seeds.inside === 1 ? "point" : "points"}
+                {generated.inference.seeds.background > 0 && `, ${(generated.inference.seeds.background / 1e6).toFixed(1)} M background seeds`})
                 {generated.seconds.features > 0 && `, features ${generated.seconds.features.toFixed(1)} s`}.
               </Hint>
+              {generated.inference.components > generated.inference.seeds.inside && (
+                <StaleText>More pieces than inside points: the solve did not converge. Allow more iterations, or loosen the tolerance.</StaleText>
+              )}
               {reasons.length > 0 && <StaleText>Out of date: {reasons.join("; ")}. Generate to update.</StaleText>}
             </div>
           )}

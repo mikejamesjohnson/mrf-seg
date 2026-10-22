@@ -1,6 +1,5 @@
 """The feature grid, its interpolation, and running an extractor over it in windows."""
 
-import os
 import unittest
 
 import numpy as np
@@ -118,7 +117,9 @@ class FeatureGridTest(unittest.TestCase):
     def test_the_extractor_says_how_its_features_are_compared(self):
         image, _ = sphere_volume(dims=(24, 22, 18), spacing=(2.0, 2.0, 2.5))
         self.assertTrue(extract_features(image, 4.0, stub_extractor, CPU).unit)
-        self.assertFalse(extract_features(image, 4.0, Basic(scales=2), CPU).unit)
+        basic = extract_features(image, 4.0, Basic(), CPU)
+        self.assertFalse(basic.unit)
+        np.testing.assert_array_equal(basic.values[0], basic.intensity)  # the image itself, in HU
 
     def test_extract_gives_the_extractor_a_unit_range_volume_on_the_feature_grid(self):
         image, _ = sphere_volume(dims=(24, 22, 18), spacing=(2.0, 2.0, 2.5))
@@ -164,7 +165,7 @@ class PointwiseModel(torch.nn.Module):
 
 class WindowingTest(unittest.TestCase):
     def extractor(self, model, window=32, overlap=0.5):
-        extractor = Learned(model.eval(), {"args": {"patch": window}})
+        extractor = Learned(model.eval(), {"window": window})
         extractor.overlap = overlap
         return extractor
 

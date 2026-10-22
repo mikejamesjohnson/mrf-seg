@@ -16,28 +16,41 @@ import { EXTRACTOR_LABELS, fieldKeys, settingGroup, shownFields, type FeatureExt
 const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
 
 /**
- * How the segmentation is set up, in the side panel's sections: the features (which extractor,
- * on what grid), then the CRF's unary and pairwise potentials and its inference, each a table
- * of settings. Not disabled while a Generate runs: it took its own copy of the settings, and a
+ * How the segmentation is set up, in the side panel's sections: the affinities (from the
+ * image's contrast or the network, on what grid), the seeds, and the solver, each a table of
+ * settings. Not disabled while a Generate runs: it took its own copy of the settings, and a
  * change made meanwhile marks it out of date.
  */
 
-/** Feature extraction: the backend's session and its features, then the extractor and its options. */
+/** Affinities: the backend's session and its features, then the extractor and its options. */
 export function FeaturesPanel() {
   const image = useSceneStore((s) => currentImage(s));
   const settings = useSceneStore((s) => s.segmentation.settings);
   const extractors = useSceneStore((s) => s.extractors);
+  const defaultsFrom = useSceneStore((s) => s.segmentation.defaultsFrom);
   const info = extractors[settings.featureExtractor];
   return (
     <div className="space-y-3">
       {image && <SessionStatus image={image} />}
-      <SettingRows group="Feature extraction" />
+      <p className="font-mono text-[10px] text-muted-foreground">{settingGroup("Affinities").note}</p>
+      <SettingRows group="Affinities" />
       {info && !info.available && <ErrorText>{info.note}</ErrorText>}
       {info?.available && info.note && settings.featureExtractor === "learned" && (
         <Hint>
           Checkpoint: <span className="break-all">{info.note}</span>
         </Hint>
       )}
+      <div className="flex items-start justify-between gap-2">
+        <Hint>
+          {settings.featureExtractor === "basic"
+            ? "Grady's random walker: an edge's affinity falls with the HU step across it. A point seed in a vessel whose walls are ramps of a few voxels leaks within millimetres; the baseline the network is measured against."
+            : "The network's log-affinity on each edge, learned so that a point carries through the vessel it is in and no further: high along the lumen, far below zero across its wall, and the background a conductor to the seeded fat."}
+          {defaultsFrom === "learned" && settings.featureExtractor === "learned" && " Loaded from the checkpoint: the settings it was trained with."}
+        </Hint>
+        <Button size="xs" variant="ghost" className="shrink-0 text-muted-foreground" onClick={resetPotentials} title="Back to the current extractor's affinity, seed and solver settings">
+          Reset
+        </Button>
+      </div>
     </div>
   );
 }
@@ -149,7 +162,7 @@ function SettingControl({ field, settings }: { field: SettingField; settings: MR
   }
 }
 
-/** A section of the CRF's settings: the group's formula, its rows, and what they mean. */
+/** A section of the walker's settings: the group's formula, its rows, and what they mean. */
 function PotentialSection({ group, children }: { group: string; children?: React.ReactNode }) {
   const note = settingGroup(group).note;
   return (
@@ -161,55 +174,40 @@ function PotentialSection({ group, children }: { group: string; children?: React
   );
 }
 
-/** The unary potential: the evidence for lumen at each voxel, from the points (Basic) or the network (Learned). */
-export function UnaryPanel() {
-  const extractor = useSceneStore((s) => s.segmentation.settings.featureExtractor);
-  const defaultsFrom = useSceneStore((s) => s.segmentation.defaultsFrom);
+/** The seeds: the points, held at their labels, and the background below a threshold held at 0. */
+export function SeedsPanel() {
+  const generated = useSceneStore((s) => s.segmentation.generated);
   return (
-    <PotentialSection group="Unary potential">
-      <div className="flex items-start justify-between gap-2">
-        <Hint>
-          {extractor === "basic"
-            ? "Each voxel is compared with the inside points (what lumen looks like here) against the image as a whole and the outside points (what it does not): a kernel density ratio. A voxel like no point is background."
-            : "The network's unary logit at each voxel. It sees the points: an inside point selects the vessel it is in, an outside point drops the structure it is in, and with no points it segments every coronary. Generate re-runs it in windows around the points."}
-          {defaultsFrom === "learned" && extractor === "learned" && " Loaded from the checkpoint: the settings it was trained with."}
-        </Hint>
-        <Button size="xs" variant="ghost" className="shrink-0 text-muted-foreground" onClick={resetPotentials} title="Back to the current extractor's potential and inference settings">
-          Reset
-        </Button>
-      </div>
-    </PotentialSection>
-  );
-}
-
-/** The pairwise potential: how much a label change between two neighbours costs. */
-export function PairwisePanel() {
-  const extractor = useSceneStore((s) => s.segmentation.settings.featureExtractor);
-  return (
-    <PotentialSection group="Pairwise potential">
+    <PotentialSection group="Seeds">
       <Hint>
-        {extractor === "basic"
-          ? "Contrast-sensitive: a label may change cheaply where the image does, so the boundary snaps to the vessel wall. The same cost in every direction."
-          : "The network's coupling on each edge, learned: cheap across a wall, expensive along a vessel."}
+        An inside point is held at 1, an outside point at 0, exactly: the walker conditions on them rather than being told about them, so a corrected voxel
+        flips, and another inside point can only raise the probability, another outside point only lower it.
+        {generated && (
+          <>
+            {" "}
+            Last Generate: {generated.inference.seeds.inside} inside, {generated.inference.seeds.outside} outside
+            {generated.inference.seeds.background > 0 && `, ${generated.inference.seeds.background.toLocaleString()} background`} seeds.
+          </>
+        )}
       </Hint>
     </PotentialSection>
   );
 }
 
-/** The inference: mean field over the grid, with the points clamped. */
-export function InferencePanel() {
+/** The solver: conjugate gradients on the walker's system, preconditioned by a multigrid cycle. */
+export function SolverPanel() {
   const generated = useSceneStore((s) => s.segmentation.generated);
   return (
-    <PotentialSection group="Inference">
+    <PotentialSection group="Solver">
       <Hint>
-        The points are clamped to their labels; every other voxel takes the probability its evidence and its neighbours give it, sweep after sweep. The
-        probability map is this marginal; the labelmap thresholds it.
+        Every free voxel ends up at the affinity-weighted mean of its neighbours, the seeds held: the probability that a walker from there reaches an inside
+        point before an outside one. No piece of the result can be without an inside point.
         {generated && (
           <>
             {" "}
-            Last Generate: {generated.inference.sweeps} sweeps, last change {generated.inference.delta.toExponential(1)}
-            {generated.inference.converged ? ", converged" : ", not yet converged (more sweeps would change it)"}
-            {generated.inference.components !== null && `; kept ${generated.inference.components} connected ${generated.inference.components === 1 ? "component" : "components"}`}.
+            Last Generate: {generated.inference.iterations} iterations, residual {generated.inference.residual.toExponential(1)}
+            {generated.inference.converged ? ", converged" : ", not converged (allow more iterations)"}; {generated.inference.components}{" "}
+            {generated.inference.components === 1 ? "piece" : "pieces"}.
           </>
         )}
       </Hint>

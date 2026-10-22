@@ -1,47 +1,39 @@
-"""The network: a 3D U-Net from the image and the click maps (`learned.network_input`) to four
-output channels at every voxel, the CRF's potentials there -- the unary logit, and the raw
-couplings to the neighbour along +z, +y and +x, which `softplus` makes non-negative
-(`PotentialNet.potentials`).
+"""The network: a 3D U-Net from the image (`learned.network_input`) to three output channels at
+every voxel, the log-affinities of its edges to the neighbour along +z, +y and +x, which
+`rw.affinities` exponentiates (and clamps) into the walker's graph.
 
 Five resolutions (a 96^3 patch: 96 -> 48 -> 24 -> 12 -> 6), two 3x3x3 convolutions per level
 with a normalisation and a GELU after each, max-pooling down, transposed convolutions up, skip
-connections by concatenation, and a 1x1x1 head to 1 + 3 channels. Every layer is a local rule
+connections by concatenation, and a 1x1x1 head to 3 channels. Every layer is a local rule
 applied at every position, so the network is defined on a patch and runs on a volume of any
 size (padded to a multiple of 16, the coarsest stride); the normalisation is over the channels
-of each voxel (`ChannelNorm`) and not over the patch, so the potentials of a voxel depend on its
+of each voxel (`ChannelNorm`) and not over the patch, so the affinities of a voxel depend on its
 surroundings alone and windows of a volume agree where they overlap. GroupNorm, whose
 statistics are the window's, is kept as `norm="group"` for an ablation.
 
-The head's unary bias starts negative (`PotentialNet.UNARY_BIAS`): lumen is a fraction of a
-percent of the voxels, and a network that begins by calling everything background trains
-smoothly. Its coupling bias starts where softplus gives `COUPLING_INIT`, which is small on
-purpose: with couplings near 1 the mean field drives every marginal to the all-background
-consensus (six neighbours near 0 each add about -w to the logit), the sigmoids saturate, and
-almost no gradient reaches the unary through the sweeps -- the network then learns to smooth
-harder rather than to find lumen. Near 0.1 the sweeps are almost the identity at first, the
-gradient flows, and the network raises the couplings where smoothing helps once the unary has
-learned something.
+The head's bias starts at 0: every edge begins at affinity 1, a uniform graph on which the
+walker's probability is a smooth blob about the seed, and the first gradients say where to cut
+and where to join.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..mrf import AXES, Potentials
+from ..rw import AXES
 from . import IN_CHANNELS, SPACING
 
-#: Output channels: the unary logit and one coupling per axis.
-OUT_CHANNELS = 1 + AXES
+#: Output channels: one log-affinity per axis.
+OUT_CHANNELS = AXES
 
 
 @dataclass(frozen=True)
 class UNet3DConfig:
-    inputs: int = IN_CHANNELS  # input channels: the image and the two click maps
+    inputs: int = IN_CHANNELS  # input channels: the image
     base: int = 32          # channels at full resolution, doubled at each level down
     levels: int = 5         # resolutions: 96 -> 48 -> 24 -> 12 -> 6 on a 96^3 patch
     norm: str = "channel"   # "channel": per voxel over its channels; "group": GroupNorm(groups)
@@ -148,29 +140,22 @@ class UNet3D(nn.Module):
         return self.head(x).float()
 
 
-class PotentialNet(nn.Module):
+class AffinityNet(nn.Module):
     """The U-Net on any volume size: each side is zero-padded to a multiple of the network's
     coarsest stride, split between both ends, and the output is cropped back. The output is the
-    raw (B, 4, z, y, x): `potentials` turns one volume of it into `mrf.Potentials`."""
-
-    #: Where the head's unary bias starts: sigmoid(-4) = 2 %, more than the lumen's share of a
-    #: vessel-centred patch but near enough that the first steps are not spent getting there.
-    UNARY_BIAS = -4.0
-    #: What the couplings start at: softplus of the head's coupling bias. Small, so the first
-    #: sweeps are nearly the identity and the gradient reaches the unary (see the module docstring).
-    COUPLING_INIT = 0.1
+    log-affinities (B, 3, z, y, x), float32: `rw.affinities` turns one volume of it into the
+    walker's graph."""
 
     def __init__(self, cfg: UNet3DConfig = UNet3DConfig()) -> None:
         super().__init__()
         self.cfg = cfg
         self.net = UNet3D(cfg)
         with torch.no_grad():
-            self.net.head.bias[0] = self.UNARY_BIAS
-            self.net.head.bias[1:] = math.log(math.expm1(self.COUPLING_INIT))  # softplus^-1
+            self.net.head.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x (B, inputs, z, y, x), the normalised HU and the click maps (`learned.network_input`) ->
-        (B, 4, z, y, x) raw potentials, float32."""
+        """x (B, inputs, z, y, x), the normalised HU (`learned.network_input`) -> (B, 3, z, y, x)
+        log-affinities, float32."""
         stride = self.cfg.stride
         sizes = x.shape[-3:]
         pads = [(-n) % stride for n in sizes]
@@ -180,38 +165,26 @@ class PotentialNet(nn.Module):
         z = self.net(x)
         return z[..., before[0]:before[0] + sizes[0], before[1]:before[1] + sizes[1], before[2]:before[2] + sizes[2]]
 
-    @staticmethod
-    def potentials(raw: torch.Tensor, unary_shift: float = 0.0, coupling_scale: float = 1.0) -> Potentials:
-        """`mrf.Potentials` from one volume of raw output (4, z, y, x): the unary as it is (plus
-        `unary_shift`), the couplings as `coupling_scale` * softplus of the rest, with the last
-        plane along each axis zeroed, as `Potentials` wants it."""
-        unary = raw[0] + unary_shift
-        coupling = F.softplus(raw[1:]) * coupling_scale
-        masked = coupling.clone()
-        for d in range(AXES):
-            n = raw.shape[1 + d]
-            masked[d].narrow(d, n - 1, 1).zero_()
-        return Potentials(unary, masked)
-
 
 def parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def save(model: PotentialNet, path: str, **extra) -> None:
+def save(model: AffinityNet, path: str, **extra) -> None:
     """The model with what the extractor needs to run it: its config, the grid spacing (`SPACING`
     unless `extra` says otherwise) and whatever else is given (the training's arguments, the step)."""
     extra.setdefault("spacing", SPACING)
     torch.save(dict(config=asdict(model.cfg), state=model.state_dict(), **extra), path)
 
 
-def load(path: str, device: str | torch.device = "cpu") -> tuple[PotentialNet, dict]:
+def load(path: str, device: str | torch.device = "cpu") -> tuple[AffinityNet, dict]:
     """The model saved at `path`, in eval mode on `device`, and whatever else was saved with it
     (including `spacing`)."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
     config = dict(blob["config"])
-    # A checkpoint from before the click maps has one input channel: read it off the first convolution.
     config.setdefault("inputs", int(blob["state"]["net.down.0.net.0.weight"].shape[1]))
-    model = PotentialNet(UNet3DConfig(**config))
+    model = AffinityNet(UNet3DConfig(**config))
+    if int(blob["state"]["net.head.weight"].shape[0]) != OUT_CHANNELS:
+        raise ValueError(f"{path} is not an affinity network: its head has {int(blob['state']['net.head.weight'].shape[0])} outputs, not {OUT_CHANNELS}")
     model.load_state_dict(blob["state"])
     return model.to(device).eval(), {k: v for k, v in blob.items() if k not in ("config", "state")}

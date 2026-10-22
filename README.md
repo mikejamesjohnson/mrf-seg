@@ -1,23 +1,26 @@
-# MRFSeg: conditional random field segmentation
+# MRFSeg: random-walker segmentation on learned affinities
 
-A local, browser-based editor for segmenting the coronary arteries in CT with a Markov random
-field. It opens a 3D image from a file path and shows it on slices and in 3D. You click points
-inside and outside the vessel. A conditional random field (CRF) over the voxels -- a unary
-potential per voxel saying how much the evidence favours lumen, and a pairwise potential per
-pair of neighbours saying how much a label change between them costs -- is inferred with your
-points clamped, and the probability that each voxel is lumen is drawn over the image. You can
-then turn the result into a labelmap and a surface mesh.
+A local, browser-based editor for segmenting the coronary arteries in CT. It opens a 3D image
+from a file path and shows it on slices and in 3D. You click a point inside a vessel (and, if
+need be, points outside what you do not want). The voxels form a graph whose edges carry
+*affinities* -- how freely the label flows between two neighbours -- and the probability drawn
+over the image is the random walker's: the chance that a walker started at a voxel, stepping to
+a neighbour in proportion to the affinity, reaches an inside point before an outside one. That
+is the exact posterior mean of a Gaussian Markov random field conditioned on your points, so a
+clicked voxel is at 1 (or 0) exactly, another inside point can only raise the probability and
+another outside point only lower it, and every piece of the result holds an inside point. You
+can then turn the result into a labelmap and a surface mesh.
 
-The potentials come from one of two places:
+The affinities come from one of two places:
 
-- **Basic** (works out of the box): the image's brightness at several scales, with potentials
-  made by hand from the points: a kernel-density likelihood ratio for the unary, and a
-  contrast-sensitive coupling in Hounsfield units. This is what to start with.
-- **Learned** (after training): a 3D U-Net whose four output channels per voxel *are* the
-  potentials, trained from scratch on coronary CTA with coronary label maps through the same
-  mean-field inference the editor runs. It sees your points: an inside point selects the vessel
-  it is in, an outside point drops the structure it is in, and with no points it segments every
-  coronary. It needs its checkpoint; see [Training the network](#training-the-network).
+- **Basic** (works out of the box): Grady's random walker as published -- an edge's affinity
+  falls with the Hounsfield step across it. Good for a bright blob with a sharp wall; weak for a
+  coronary from a single point, whose walls are ramps a few voxels wide that a point seed leaks
+  through within millimetres. This is the baseline.
+- **Learned** (after training): a 3D U-Net whose three output channels per voxel *are* the
+  log-affinities of its edges, trained from scratch on coronary CTA so that one point carries
+  through the vessel it is in and no further. It needs its checkpoint; see
+  [Training the network](#training-the-network).
 
 The setup follows `pseg3d` (the Gaussian process editor this grew out of): Next.js + React +
 Tailwind/shadcn for the interface, vtk.js for rendering, Zustand for state. The segmentation
@@ -42,8 +45,8 @@ npm run dev
 ```
 
 `npm run dev` starts the editor and the segmentation backend together, and Ctrl+C stops both.
-Without `python/.venv` the editor still runs, and its Feature extraction panel says the backend
-is off. The editor listens on port 8003 and the backend on 8004, so both can run beside pseg3d
+Without `python/.venv` the editor still runs, and its Affinities panel says the backend is off.
+The editor listens on port 8003 and the backend on 8004, so both can run beside pseg3d
 (8001 / 8002).
 
 Open <http://127.0.0.1:8003/editor>, type the full path of an image and press **Open**, or use
@@ -64,9 +67,9 @@ orientation. The editor reads files through its own local server, which listens 
   0.1 mm images; the panel's **Resampling spacing** starts at 0.5 mm (the floor for CTs), so set
   it to 0.1-0.2 mm for them.
 - A real CTA: `/Users/mjohnson/Documents/pseg3d/data/demo.mhd`.
-- A bright sphere: `/Users/mjohnson/Documents/pseg3d/data/sphere.mha`. It is a third of its
-  image, not the rare structure the Basic unary expects of coronary lumen: raise **a₀, prior
-  logit** to about 2 and **ℓ features** to 1 for it.
+- A bright sphere: `/Users/mjohnson/Documents/pseg3d/data/sphere.mha`. Its background is 0 HU,
+  not below it, so turn **Seed the background** off (or set its threshold above 0) and give it
+  an outside point or two; Basic then segments it from one inside point.
 - The training scans themselves are `.npy` files in the cache and not readable by the editor;
   `python/tools/` has `extract_imagecas.py` for the NIfTI originals, which the editor cannot read
   either. To look at one, convert it to MetaImage with SimpleITK (`sitk.WriteImage(sitk.ReadImage(path), "scan.mha")`).
@@ -75,127 +78,132 @@ orientation. The editor reads files through its own local server, which listens 
 
 Opening an image creates an `MRFSegmentation` for it in the backend
 (`python/mrfseg/segmentation.py`). The backend starts extracting the image's features straight
-away, and the panel shows the progress. The side panel follows the model: **Image**, **Feature
-extraction**, **Unary potential**, **Pairwise potential**, **Inference**, **Points**, **Generate**.
+away (Learned: running the network over the whole image, once), and the panel shows the
+progress. The side panel follows the model: **Image**, **Affinities**, **Seeds**, **Solver**,
+**Points**, **Generate**.
 
 1. **Points.** Choose **Inside** (key **2**) or **Outside** (key **3**) and click in any slice
    view; **Navigate** (key **1**) turns placing off. An inside point goes in the lumen of a vessel
-   you want; an outside point on something you do not. Basic needs at least one inside point;
-   Learned needs none. Points can be dragged, selected and removed as in pseg3d (see the Points
-   section of the panel).
-2. **Generate segmentation.** Builds the potentials from the features and the points (Learned
-   re-runs the network in windows around the points), clamps the points to their labels, runs
-   the mean-field sweeps, keeps the lumen the inside points connect to (**Connected**, in the
-   Inference section: an inside point reaches as far as its vessel reaches, and unclicked vessels
-   drop out), and draws three maps over the image:
+   you want; an outside point on something you do not. A Generate needs at least one inside
+   point. Points can be dragged, selected and removed as in pseg3d (see the Points section of the
+   panel).
+2. **Generate segmentation.** Holds the inside points at 1 and the outside points at 0, and
+   every voxel below the HU threshold (fat, air) at 0 as well (**Seed the background**, in the
+   Seeds section: it is what drains a point's probability out of everything its vessel's wall
+   does not hold in), solves the walker on the affinities, and draws two maps over the image:
 
-   | Map             | What it is                                                            | Drawn as                          |
-   | --------------- | --------------------------------------------------------------------- | --------------------------------- |
-   | **Probability** | p(y = 1): the mean-field marginal, the chance a voxel is lumen        | jet, 0 to 1 (shown at first)      |
-   | **Unary logit** | a: the evidence alone, before the coupling has its say; positive is lumen | blue inside, red outside      |
-   | **Coupling**    | the mean coupling of the edges at each voxel: low where a label may change cheaply | dark to bright        |
+   | Map             | What it is                                                                       | Drawn as                      |
+   | --------------- | -------------------------------------------------------------------------------- | ----------------------------- |
+   | **Probability** | p: the chance a walker from the voxel reaches an inside point first              | jet, 0 to 1 (shown at first)  |
+   | **Affinity**    | the mean log-affinity of the voxel's edges: above 0 the label flows, below a wall | blue holds back, red flows   |
 
    Each map can be shown, hidden, faded and sampled (trilinear or nearest) on its own. The
-   Inference section says how many sweeps it took and whether it converged.
+   Solver section says how many iterations it took, whether it converged, and how many pieces
+   the result has (one per inside point at most, when it did).
 3. **Generate labelmap.** 1 for every voxel with probability at least **Threshold p** (0.5), 0
    elsewhere.
-4. **Generate surface.** Marching cubes on the probability at the threshold, or on the unary
-   logit's zero level (the evidence alone). Drawn in 3D and as an outline on the slices.
+4. **Generate surface.** Marching cubes on the probability at the threshold. Drawn in 3D and as
+   an outline on the slices.
 
 Each step has an **Auto** box: a ticked step runs by itself whenever what it is made from
 changes (a point added, moved or removed; a setting; a product's own threshold), in the
-pipeline's order, and a stale segmentation is never built from.
+pipeline's order, and a stale segmentation is never built from. A Generate after a new point
+starts the solver from the last probability, so a correction is quick.
 
 ### Settings
 
-| Section            | Setting                 | Default                                                | Meaning                                                                                  |
-| ------------------ | ----------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| Feature extraction | Extractor               | Learned if its checkpoint is there, else Basic         | What makes the features, and so the potentials                                           |
-| Feature extraction | Resampling spacing, mm  | the image's voxel size, at least 0.5; Learned 0.5      | The isotropic grid the features are extracted and the CRF inferred on                   |
-| Feature extraction | Scales, Edges, Shape    | 4, off, off (Basic)                                    | The blurs, and their edge strength and Hessian eigenvalues                               |
-| Feature extraction | Compute on              | GPU if present                                         | CUDA, else the Apple GPU, else the CPU                                                   |
-| Unary potential    | ℓ features              | 0.5 (Basic)                                            | Kernel width in feature space, in standard deviations of the image's features            |
-| Unary potential    | ℓ position, mm          | 20 × the image's largest voxel (Basic)                 | How far a point's evidence reaches                                                       |
-| Unary potential    | a₀, prior logit         | −2 (Basic)                                             | Added to every logit: how much the evidence for lumen must outweigh the evidence against |
-| Unary potential    | β, evidence scale       | 1 (Basic)                                              | What the evidence is multiplied by, against the coupling                                 |
-| Unary potential    | Shift                   | 0 (Learned)                                            | Added to the network's logits                                                            |
-| Pairwise potential | λ, coupling             | 1                                                      | The coupling of a contrast-free edge (Basic), or a factor on the network's (Learned)     |
-| Pairwise potential | δ, contrast HU          | 100 (Basic)                                            | An edge with this HU step keeps 61 % of the coupling                                     |
-| Pairwise potential | Floor                   | 0.1 (Basic)                                            | The share of the coupling every edge keeps                                               |
-| Inference          | Sweeps                  | 50 (Learned: as trained)                               | Mean-field sweeps; stops early once nothing changes by more than 0.001                   |
-| Inference          | Connected               | on                                                     | Keep only the lumen the inside points connect to through p ≥ 0.5; p is 0 on the rest     |
+| Section    | Setting                | Default                                           | Meaning                                                                               |
+| ---------- | ---------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Affinities | Affinities from        | Learned if its checkpoint is there, else Basic    | Grady's contrast affinities, or the network's log-affinities                          |
+| Affinities | Resampling spacing, mm | the image's voxel size, at least 0.5; Learned 0.5 | The isotropic grid the features are extracted and the walker solved on               |
+| Affinities | δ, contrast HU         | 40 (Basic)                                        | An edge whose voxels differ by this much in HU keeps 61 % of its affinity             |
+| Affinities | Scale                  | 1 (Learned)                                       | What the network's log-affinities are multiplied by; above 1 sharpens its decisions   |
+| Affinities | Compute on             | GPU if present                                    | CUDA, else the Apple GPU, else the CPU                                                |
+| Seeds      | Seed the background    | on                                                | Hold every voxel below the threshold at 0, as an outside point would                  |
+| Seeds      | Below, HU              | 0                                                 | The threshold: fat is about −100 HU, soft tissue above 0                              |
+| Seeds      | Keep away, voxels      | 1                                                 | How far the background seeds keep from anything above the threshold (partial volume) |
+| Solver     | Tolerance              | 0.0001                                            | Stop once no voxel's probability would still move by more than this                   |
+| Solver     | Iterations at most     | 1000                                              | The result says whether the solver converged within these                             |
+| Solver     | Preconditioner         | Multigrid                                         | A few dozen iterations whatever the vessel's length; Jacobi is cheaper per iteration and needs hundreds |
 
-Coarser spacing is faster: the inference's time and memory go with the number of voxels (a
-512 × 512 × 300 scan at 0.5 mm is about 40 M voxels and takes a few seconds on an Apple GPU,
-longer on the CPU). A grid too large for memory is refused with the spacing that would fit.
+Coarser spacing is faster: the solver's time and memory go with the number of voxels (a
+512 × 512 × 300 scan at 0.5 mm is about 40 M voxels and takes a few seconds on a GPU, longer on
+the CPU). A grid too large for memory is refused with the spacing that would fit.
 
-## Measuring the potentials
+## Measuring the affinities
 
-`python/mrfseg/learned/evaluate.py` measures a way of making potentials with a simulated user on
-cubes cut from the cache's test scans, segmented exactly as the editor segments:
+`python/mrfseg/learned/evaluate.py` measures a way of making affinities with a simulated user on
+whole test scans, segmented exactly as the editor segments them, from one click in a coronary
+tree and then up to four corrections:
 
 ```bash
 cd python
 .venv/bin/python -m mrfseg.learned.evaluate --cache /Users/mjohnson/Documents/pseg3d/data/casx/cache --basic --cases 20
-.venv/bin/python -m mrfseg.learned.evaluate --cache /Users/mjohnson/Documents/pseg3d/data/casx/cache --model runs/first/best.pt
+.venv/bin/python -m mrfseg.learned.evaluate --cache /Users/mjohnson/Documents/pseg3d/data/casx/cache --model runs/walker/best.pt
 ```
 
-It reports the mean Dice after 1, 3, 5 and 10 clicks, the clicks it took to reach Dice 0.85
-and 0.90, and the leak into other vessels (the target of a cube is the vessel connected to the
-first click, which is what the points are meant to select). With the Basic defaults on 8 test
-cubes of 96³ at 0.5 mm the Dice was 0.40 / 0.52 / 0.58 after 1 / 3 / 5 clicks with no leak: the
-handcrafted potentials are precise but short of recall, which is what the network is for.
+It reports the mean Dice after 1, 3 and 5 clicks against the tree the first click is in, the
+clicks it took to reach Dice 0.85 and 0.90, the leak into the other tree and the number of
+pieces after the first click, and the seconds per click. Basic scores near 0 from one click on a
+coronary, as the model predicts (`docs/MODEL.md`, the transmission line): it is the network's
+affinities that make a single click carry.
 
 ## Training the network
 
 `python/mrfseg/learned/` trains the Learned extractor on the 0.5 mm cache pseg3d built from
 ImageCAS-X (800 scans; `<id>.image.npy`, `<id>.label.npy`, `splits.json`: see
 `python/mrfseg/learned/prepare.py` for the format). The cache stays where it is; give its
-absolute path. On the GPU workstation (24 GB), only `python/` is needed:
+absolute path. On the GPU workstation (24-32 GB), only `python/` is needed:
 
 ```bash
 git clone <this repository> mrf-seg && cd mrf-seg/python
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # torch with CUDA
-./train.sh sanity /path/to/pseg3d/data/casx/cache    # ~10 min: 300 steps and a validation; checks memory and that the loss falls
-./train.sh full   /path/to/pseg3d/data/casx/cache    # 40 000 steps, validating every 2000; rerun the same line to resume
-./train.sh eval   /path/to/pseg3d/data/casx/cache    # the simulated user on 20 test scans, Learned against Basic
+./train.sh sanity   /path/to/pseg3d/data/casx/cache   # ~10 min: 300 steps of stage 1 and a validation; checks memory and that the loss falls
+./train.sh affinity /path/to/pseg3d/data/casx/cache   # stage 1: 30 000 steps on 96^3 patches, validating every 2000; rerun the same line to resume
+./train.sh walker   /path/to/pseg3d/data/casx/cache   # stage 2: 20 000 steps on 160^3 patches from stage 1's best; rerun to resume
+./train.sh eval     /path/to/pseg3d/data/casx/cache   # the simulated user on 20 whole test scans, Learned against Basic
 ```
 
-`FULL_PIECE_MINUTES=120 ./train.sh full …` ends a piece after two hours and the same command
-carries on from where it stopped; `EXTRA="--checkpoint-sweeps"` (or `--batch 2 --accumulate 2`)
-when short of memory. The script is a thin wrapper over `python -m mrfseg.learned.train`, whose
-`--help` lists everything. Then, back on the Mac:
+`PIECE_MINUTES=120 ./train.sh affinity …` ends a piece after two hours and the same command
+carries on from where it stopped; `EXTRA="--patch 128"` when the walker stage is short of
+memory. The script is a thin wrapper over `python -m mrfseg.learned.train`, whose `--help`
+lists everything. Then, back on the Mac:
 
 ```bash
-scp workstation:mrf-seg/python/runs/first/best.pt ~/.cache/mrfseg/learned.pt   # or export MRFSEG_LEARNED_WEIGHTS=/path/to/best.pt
+scp workstation:mrf-seg/python/runs/walker/best.pt ~/.cache/mrfseg/learned.pt   # or export MRFSEG_LEARNED_WEIGHTS=/path/to/best.pt
 npm run dev
 ```
 
-`train` draws 96³ patches centred near vessels, simulates a user's clicks on each (none to 3
-inside, none to 4 outside -- some on a vessel that got no inside click), gives the network the
-image and two click maps as input, conditions the target on the clicks (the lumen connected to
-the inside clicks; everything with none; less a vessel with an outside click and no inside one),
-runs 20 mean-field sweeps *through which the loss is back-propagated*, and scores the marginals
-against the target with cross-entropy plus a soft Dice; a lighter cross-entropy on the unary
-alone keeps it a usable classifier by itself. It prints the loss and the Dice on the training
-patches and validates every 2000 steps with a simulated user on sub-volumes of validation scans
-(Dice with 0 / 1 / 3 / 5 clicks, and the leak into other vessels).
+The two stages (`python/mrfseg/learned/__init__.py`):
 
-Checkpoints: `best.pt` is the network with the best validation Dice (what the editor loads);
-`last.pt` is the whole state of the run -- network, optimiser, loss scaler, step, best score --
-written at every validation (`--checkpoint-every` to change) and whenever a piece ends, with an
-atomic rename, so a crash loses at most 2000 steps. `./train.sh full` resumes from `last.pt` by
-itself when there is one (`--resume`); `--init best.pt` starts a fresh run from a checkpoint's
-weights instead. Checkpoints, logs and runs are ignored by git (`runs/`, `*.pt`). The
-checkpoint records the settings the editor should start from with it (the sweeps it was trained
-through). On CUDA the network runs in bf16 (Ampere and later) or fp16 with loss scaling; a
-Mac's GPU works too, slowly (`--device mps`).
+1. **Affinities.** Every edge of a patch gets a target: where either voxel is lumen, 1 if both
+   are and 0 across the wall; between two background voxels, the contrast affinity with
+   δ = 100 HU, which keeps the background a connected conductor to the seeded fat. The loss is a
+   binary cross-entropy on sigmoid(z), the lumen-touching edges (a fraction of a percent of all
+   edges) and the rest weighed equally.
+2. **The walker.** With that loss kept, each (larger) patch is seeded at one lumen voxel a user
+   might click, the background below 0 HU is seeded as outside, the walker is solved, and its
+   probability is scored against the lumen connected to the seed with cross-entropy and soft
+   Dice. The gradient reaches the network through the solution *implicitly* -- one more linear
+   solve, no iterations unrolled -- so the patch can be 160³. This is the objective that matters:
+   where the affinities let the probability leak out of a vessel, or fail to carry it along one,
+   the gradient says so edge by edge.
+
+Both stages validate every so often with a simulated user on whole validation scans (Dice after
+1 / 3 / 5 clicks, the leak into the other tree, the number of pieces), and `best.pt` is the
+checkpoint with the best single-click Dice (what the editor loads); `last.pt` is the whole state
+of the run -- network, optimiser, loss scaler, step, best score -- written at every validation
+(`--checkpoint-every` to change) and whenever a piece ends, with an atomic rename, so a crash
+loses at most one validation interval. `./train.sh affinity` and `walker` resume from `last.pt`
+by themselves when there is one (`--resume`); `--init best.pt` starts a fresh run from a
+checkpoint's weights instead (how stage 2 starts). Checkpoints, logs and runs are ignored by git
+(`runs/`, `*.pt`). On CUDA the network runs in bf16 (Ampere and later) or fp16 with loss
+scaling; the solver and the losses run in fp32. A Mac's GPU works too, slowly (`--device mps`).
 
 Once `MRFSEG_LEARNED_WEIGHTS` points at a checkpoint (or it sits at `~/.cache/mrfseg/learned.pt`),
-the editor offers **Learned** and chooses it by default. Its features are the network's raw
-potentials with no points, extracted once per image in overlapping 96³ windows; a Generate
-re-runs the network in windows centred on the points, with the click maps as input, blends the
-result into those, and infers.
+the editor offers **Learned** and chooses it by default. Its features are the network's
+log-affinities, extracted once per image in overlapping 96³ windows; a Generate only seeds and
+solves.
 
 `npm run backend` runs the backend on its own (`python -m mrfseg.server`, port 8004), for
 working on it.
@@ -210,13 +218,12 @@ src/lib/io/               image file formats, into LPS mm
 src/lib/segmentation/     the backend client, and Generate, the labelmap and the surface on top of it
 src/lib/viewer/           vtk.js rendering: one ViewportController per pane
 src/lib/editor/           commands across all of those: opening an image, the debug hook
-python/mrfseg/            the core: MRFSegmentation, settings, features, the CRF, surface, image reader
-python/mrfseg/mrf.py      the model and its mean-field inference (also batched and differentiable, for training)
-python/mrfseg/handcrafted.py  the Basic potentials: kernel-density unary from the points, contrast-sensitive coupling
+python/mrfseg/            the core: MRFSegmentation, settings, features, the walker, surface, image reader
+python/mrfseg/rw.py       the random walker: the model, its seeds, the multigrid-preconditioned solver, the implicit gradient
+python/mrfseg/basic.py    the Basic affinities: Grady's contrast weights from the image's HU
 python/mrfseg/settings.py MRFSettings: defaults and bounds, mirrored by the editor (tests/settings.test.ts)
-python/mrfseg/extractors.py  the feature extractors to choose from, and how each makes the potentials
-python/mrfseg/basic.py    the default feature extractor: multi-scale blurs (+ edges, shape)
-python/mrfseg/learned/    the network, and the pipeline that trains and measures it (data, clicks, train, evaluate)
+python/mrfseg/extractors.py  the feature extractors to choose from, and how each makes the affinities
+python/mrfseg/learned/    the network, and the pipeline that trains and measures it (targets, data, train, evaluate)
 python/mrfseg/windows.py  running a network over a volume in overlapping, blended windows
 python/mrfseg/server/     the local backend: one MRFSegmentation per open image
 python/mrfseg/phantoms.py synthetic test volumes: a vessel as a CT CPR shows it, with its label

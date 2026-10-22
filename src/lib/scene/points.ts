@@ -1,4 +1,4 @@
-/** The labelled points the segmentation is made from (clamped in the CRF), and their selection. */
+/** The labelled points the segmentation is made from (the walker's seeds), and their selection. */
 
 import { clampToGrid, type Vec3 } from "@/lib/world";
 import { currentImage } from "./datasets";

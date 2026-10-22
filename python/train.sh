@@ -1,46 +1,57 @@
 #!/usr/bin/env bash
-# Train the potentials network on the 0.5 mm cache, on a machine with a GPU.
+# Train the affinity network on the 0.5 mm cache, on a machine with a GPU.
 #
-#   ./train.sh sanity /path/to/pseg3d/data/casx/cache     # a few minutes: the first 400 steps of the real schedule, one validation
-#   ./train.sh full   /path/to/pseg3d/data/casx/cache     # the real run: 40 000 steps, validating every 2000; resumable
-#   ./train.sh eval   /path/to/pseg3d/data/casx/cache     # the simulated user on 20 test scans, Learned against Basic
+#   ./train.sh sanity   /path/to/pseg3d/data/casx/cache   # a few minutes: 300 steps of the affinity stage, one validation
+#   ./train.sh affinity /path/to/pseg3d/data/casx/cache   # stage 1: the edge affinities, 30 000 steps on 96^3 patches; resumable
+#   ./train.sh walker   /path/to/pseg3d/data/casx/cache   # stage 2: + the walker's loss, 20 000 steps on 160^3 patches, from stage 1's best; resumable
+#   ./train.sh eval     /path/to/pseg3d/data/casx/cache   # the simulated user on 20 whole test scans, Learned against Basic
 #
-# Runs in pieces when the machine is shared: FULL_PIECE_MINUTES=120 ./train.sh full ... ends after two
+# Runs in pieces when the machine is shared: PIECE_MINUTES=120 ./train.sh affinity ... ends after two
 # hours, and the same command carries on from where it stopped (--resume) until it prints "done".
-# Short of memory: add --checkpoint-sweeps, or --batch 2 --accumulate 2, to EXTRA.
+# Short of memory in the walker stage: EXTRA="--patch 128" or "--accumulate 2".
 #
-# Defaults are for a 24 GB GPU (bf16, batch 4, 96^3 patches, 20 sweeps). The checkpoints and the
-# log go to runs/first (OUT); point MRFSEG_LEARNED_WEIGHTS at runs/first/best.pt for the editor.
+# Defaults are for a 24-32 GB GPU (bf16; batch 4 of 96^3 in stage 1, batch 1 of 160^3 in stage 2).
+# The checkpoints and the logs go to runs/affinity and runs/walker (RUNS); point
+# MRFSEG_LEARNED_WEIGHTS at runs/walker/best.pt for the editor (or copy it to ~/.cache/mrfseg/learned.pt).
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MODE="${1:?sanity | full | eval}"
+MODE="${1:?sanity | affinity | walker | eval}"
 CACHE="${2:?absolute path of the cache (pseg3d/data/casx/cache)}"
-OUT="${OUT:-runs/first}"
+RUNS="${RUNS:-runs}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 EXTRA="${EXTRA:-}"
 
+piece() {  # --resume when there is something to resume, --time-limit when asked for pieces
+  local out="$1"
+  if [ -f "$out/last.pt" ]; then echo --resume; fi
+  if [ -n "${PIECE_MINUTES:-}" ]; then echo --time-limit "$PIECE_MINUTES"; fi
+}
+
 case "$MODE" in
   sanity)
-    # The real schedule (40 000 steps, a short warm-up), stopped after 400: the learning rate is
-    # then the full run's, not a 300-step cosine's, so what the loss and the Dice do is what the
-    # full run would do in its first minutes.
-    rm -rf "${OUT}-sanity"
-    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "${OUT}-sanity" --steps 40000 --stop-after 400 --warmup 100 \
-      --log-every 25 --val-every 400 --val-cases 4 --val-clicks 3 --workers 8 $EXTRA
+    # The real schedule (30 000 steps, a short warm-up), stopped after 300: the learning rate is
+    # then the full run's, so what the losses do is what the full run would do in its first minutes.
+    rm -rf "$RUNS/sanity"
+    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "$RUNS/sanity" --steps 30000 --stop-after 300 --warmup 100 \
+      --log-every 25 --val-every 300 --val-cases 2 --val-clicks 3 --workers 8 $EXTRA
     ;;
-  full)
-    ARGS=(--cache "$CACHE" --out "$OUT" --steps 40000 --batch 4 --workers 8 --val-every 2000)
-    if [ -f "$OUT/last.pt" ]; then ARGS+=(--resume); fi
-    if [ -n "${FULL_PIECE_MINUTES:-}" ]; then ARGS+=(--time-limit "$FULL_PIECE_MINUTES"); fi
-    "$PYTHON" -m mrfseg.learned.train "${ARGS[@]}" $EXTRA
+  affinity)
+    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "$RUNS/affinity" --steps 30000 --batch 4 --patch 96 --workers 8 \
+      --val-every 2000 $(piece "$RUNS/affinity") $EXTRA
+    ;;
+  walker)
+    INIT=()
+    if [ ! -f "$RUNS/walker/last.pt" ]; then INIT=(--init "$RUNS/affinity/best.pt"); fi
+    "$PYTHON" -m mrfseg.learned.train --cache "$CACHE" --out "$RUNS/walker" --steps 20000 --batch 1 --patch 160 --workers 8 \
+      --walker-weight 1 --lr 1e-4 --warmup 500 --val-every 1000 "${INIT[@]}" $(piece "$RUNS/walker") $EXTRA
     ;;
   eval)
-    "$PYTHON" -m mrfseg.learned.evaluate --cache "$CACHE" --model "$OUT/best.pt" --basic --cases 20 --out "$OUT/eval"
+    "$PYTHON" -m mrfseg.learned.evaluate --cache "$CACHE" --model "$RUNS/walker/best.pt" --basic --cases 20 --out "$RUNS/eval"
     ;;
   *)
-    echo "unknown mode $MODE: sanity | full | eval" >&2
+    echo "unknown mode $MODE: sanity | affinity | walker | eval" >&2
     exit 2
     ;;
 esac

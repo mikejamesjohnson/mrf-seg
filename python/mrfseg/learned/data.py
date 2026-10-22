@@ -1,26 +1,22 @@
-"""Training items from the cache: a patch of a scan, its lumen label, and a few simulated clicks.
+"""Training items from the cache: a patch of a scan, its lumen label, and one simulated click.
 
 A patch is `PatchConfig.size` voxels a side, cut from a scan in the cache (`prepare.py`). Most
 patches are centred near a labelled voxel, offset by up to `jitter` so the vessel is not always
 in the middle; the rest fall anywhere in a box around the labelled voxels, for background. The
-target is the binary lumen label on the patch (every segment label collapsed to 1), which is
-what the editor segments.
+label is read as binary: lumen or not, whatever the map's segment labels say.
 
-The clicks are what a user might have placed on the patch by the time the network is asked
-(`clicks.random_clicks`): a few inside, spread over the lumen's connected components so a small
-branch gets its share, and a few outside -- some on a vessel that got no inside click, where a
-user clicks to drop what is not wanted, the rest mostly within `near_wall` mm of the lumen,
-where a user's outside clicks go. How many of each is drawn per item, from none at all (the
-network must segment with no help, as the editor lets it) to `max_inside` and `max_outside`.
-The network sees the clicks as two input channels (`learned.click_maps`), and the target is
-conditioned on them (`clicks.conditioned_target`): with inside clicks, the lumen connected to
-them and nothing else; without, all of it; less a vessel with an outside click and no inside
-one. The clicks are clamped during the mean-field inference the loss is taken through as well.
+Each item also carries one *seed*, a lumen voxel drawn as a user's click would land
+(`targets.random_seed`), and the *tree* that click selects: the face-connected lumen holding it
+within the patch (`targets.tree_of`). The walker stage of the training seeds the walker there
+and scores its probability against the tree; the affinity stage needs neither (the edge targets
+come from the label and the HU, `targets.edge_targets`, on the GPU). A patch without lumen has
+no seed (-1) and an empty tree.
 
 Augmentation: the 48 symmetries of the cube (flips and axis permutations; the grid is isotropic
-and anatomy's orientation means nothing to the potentials) and a little HU scale and offset
-jitter. The clicks are drawn after the symmetry, on the label as augmented. Without
-augmentation, item i is the same patch and clicks every time.
+and anatomy's orientation means nothing to the affinities -- the three affinity channels follow
+the patch's axes, which is right, since the targets are made from the patch as augmented) and a
+little HU scale and offset jitter. Without augmentation, item i is the same patch and seed every
+time.
 """
 
 from __future__ import annotations
@@ -32,34 +28,20 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy import ndimage
 
 from . import network_input
-from .clicks import conditioned_target, random_clicks
 from .prepare import read_index, read_splits
+from .targets import SIX, random_seed, tree_of
 
-SIX = ndimage.generate_binary_structure(3, 1)  # 6-connectivity, as the CRF's edges
-#: Clicks are padded to this many rows per item, label 0 marking the padding.
-MAX_CLICKS = 8
+__all__ = ["SIX", "Case", "PatchConfig", "PatchDataset", "cut", "load_cases", "make_item", "patch_origin", "symmetry"]
 
 
 @dataclass(frozen=True)
 class PatchConfig:
     size: int = 96                      # voxels a side; a multiple of 16
-    max_inside: int = 3                 # inside clicks per patch, at most (drawn uniformly from 0)
-    max_outside: int = 4                # outside clicks per patch, at most (drawn uniformly from 0)
-    no_click_share: float = 0.2         # of patches given no clicks at all, whatever the draw
-    near_wall: float = 2.0              # mm: how close to the lumen an outside click near the wall is
-    near_wall_share: float = 2.0 / 3.0  # of the outside clicks not on a vessel, near the wall
-    on_lumen_share: float = 0.3         # of the outside clicks, on a vessel that got no inside click
-    margin: int = 4                     # voxels a click keeps from the patch's faces
     vessel_share: float = 0.8           # of patches placed near a labelled voxel
     jitter: int = 32                    # voxels: how far that voxel may be from the patch's centre
     heart_margin: int = 48              # voxels around the labelled voxels' box the other patches may reach
-
-    def __post_init__(self) -> None:
-        if self.max_inside + self.max_outside > MAX_CLICKS:
-            raise ValueError(f"at most {MAX_CLICKS} clicks per patch")
 
 
 class Case:
@@ -94,6 +76,11 @@ class Case:
         if self._lumen is None:
             self._lumen = np.load(self.cache / f"{self.id}.lumen.npy")
         return self._lumen
+
+    @property
+    def fill(self) -> int:
+        """The HU a patch is padded with where the scan ends: the scan's lowest."""
+        return int(self.meta.get("hu_range", [-1024])[0])
 
     def world_to_index(self, points: np.ndarray) -> np.ndarray:
         """Continuous (z, y, x) indices of (n, 3) LPS mm points (x, y, z)."""
@@ -147,32 +134,26 @@ def symmetry(arrays: list[np.ndarray], rng: np.random.Generator) -> list[np.ndar
 
 
 def make_item(case: Case, cfg: PatchConfig, rng: np.random.Generator, augment: bool) -> dict:
-    """One training item from `case`: the network's input (IN_CHANNELS, s, s, s) float32 (the
-    normalised patch and the click maps), the target (s, s, s) uint8 (the lumen as the clicks
-    condition it, `clicks.conditioned_target`), the clicks (MAX_CLICKS, 4) int64 rows of
-    (z, y, x, label) padded with label 0, and where the patch came from."""
+    """One training item from `case`: the network's input (IN_CHANNELS, s, s, s) float32, the
+    HU (s, s, s) float32 the targets and seeds are made from, the lumen label (s, s, s) uint8,
+    the seed (3,) int64 (-1 without lumen), the seed's tree (s, s, s) uint8, and where the
+    patch came from."""
     origin = patch_origin(case, cfg, rng)
-    hu = cut(case.image, origin, cfg.size, fill=int(case.meta.get("hu_range", [-1024])[0])).astype(np.float32)
-    label = cut(case.label, origin, cfg.size, fill=0)
+    hu = cut(case.image, origin, cfg.size, fill=case.fill).astype(np.float32)
+    label = (cut(case.label, origin, cfg.size, fill=0) > 0).astype(np.uint8)  # binary: lumen or not, whatever the map says
     if augment:
         hu, label = symmetry([hu, label], rng)
         hu = hu * rng.uniform(0.95, 1.05) + rng.uniform(-10.0, 10.0)
-    lumen = label > 0
-    if rng.random() < cfg.no_click_share:
-        n_inside = n_outside = 0
-    else:
-        n_inside, n_outside = int(rng.integers(0, cfg.max_inside + 1)), int(rng.integers(0, cfg.max_outside + 1))
-    clicks = random_clicks(lumen, rng, n_inside, n_outside, case.spacing, cfg.near_wall, cfg.near_wall_share, cfg.margin, cfg.on_lumen_share)
-    padded = np.zeros((MAX_CLICKS, 4), dtype=np.int64)
-    padded[: len(clicks)] = clicks[:MAX_CLICKS]
-    target = conditioned_target(lumen, padded)
-    return dict(image=network_input(hu, padded), label=target.astype(np.uint8), clicks=padded, case=case.id, origin=origin)
+    seed = random_seed(label, rng)
+    tree = tree_of(label, seed) if seed is not None else np.zeros(label.shape, dtype=bool)
+    return dict(image=network_input(hu), hu=hu, label=label, seed=np.array(seed if seed is not None else (-1, -1, -1), dtype=np.int64),
+                tree=tree.astype(np.uint8), case=case.id, origin=origin)
 
 
 class PatchDataset(torch.utils.data.Dataset):
     """One item per draw: a patch of a random position in scan `index`. With `augment`, every
     draw is new (a counter per worker goes into the seed); without, item i is the same patch and
-    clicks every time, which is what validation wants."""
+    seed every time, which is what validation wants."""
 
     def __init__(self, cache: str | Path, split: str, cfg: PatchConfig = PatchConfig(), augment: bool = True,
                  seed: int = 0, limit: int | None = None) -> None:
@@ -192,8 +173,8 @@ class PatchDataset(torch.utils.data.Dataset):
         else:
             rng = np.random.default_rng([self.seed, index])
         item = make_item(self.cases[index], self.cfg, rng, self.augment)
-        return dict(image=torch.from_numpy(item["image"]), label=torch.from_numpy(item["label"]),
-                    clicks=torch.from_numpy(item["clicks"]), spacing=torch.tensor(self.cases[index].spacing))
+        return dict(image=torch.from_numpy(item["image"]), hu=torch.from_numpy(item["hu"]), label=torch.from_numpy(item["label"]),
+                    seed=torch.from_numpy(item["seed"]), tree=torch.from_numpy(item["tree"]))
 
 
 def describe(cache: str | Path) -> str:

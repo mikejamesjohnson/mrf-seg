@@ -1,7 +1,7 @@
 # Architecture
 
 MRFSeg is two programs on one computer: a Next.js editor in the browser, and a Python backend
-holding the conditional random field. The browser only ever talks to the editor's own server,
+holding the random walker and its affinities. The browser only ever talks to the editor's own server,
 which reads image files for it (`/api/file`) and forwards segmentation requests (`/api/mrf`).
 The model itself is written out in [`MODEL.md`](MODEL.md).
 
@@ -60,7 +60,7 @@ the concept:
 | `scene/datasets.ts`       | datasets, nodes, world bounds, load status                     |
 | `scene/views.ts`          | each slice view's plane, layout, what each pane shows          |
 | `scene/points.ts`         | the labelled points, the selection, the place mode             |
-| `segmentation/state.ts`   | MRF settings, the session and its progress, its products        |
+| `segmentation/state.ts`   | the walker's settings, the session and its progress, its products |
 
 Pure questions about state (`currentImage`, `scrollStep`, `planesForThreeD`, `isBusy`,
 `staleReasons`, `productStale`) sit beside the slice they read, and the panels and auto update
@@ -71,9 +71,9 @@ only its own slice; what spans slices is a command, like `editor/openImage.ts`.
 
 | Module          | What it is                                                                      |
 | --------------- | ------------------------------------------------------------------------------- |
-| `settings.ts`   | `MRFSettings` and the panel's table of them (mirrors `mrfseg/settings.py`), grouped as the model is: features, unary, pairwise, inference; an extractor's starting values |
+| `settings.ts`   | `MRFSettings` and the panel's table of them (mirrors `mrfseg/settings.py`), grouped as the model is: affinities, seeds, solver; an extractor's starting values |
 | `state.ts`      | the slice, and the questions asked of it                                        |
-| `maps.ts`       | the three maps (probability, unary logit, coupling): label, compact type, how each is first drawn and its legend |
+| `maps.ts`       | the two maps (probability, affinity): label, compact type, how each is first drawn and its legend |
 | `backend.ts`    | the wire format: requests to `/api/mrf`, binary layouts                          |
 | `flow.ts`       | what the async flows share: the current-image guard, polling, a lost session    |
 | `session.ts`    | opening the image's session with the page, and keeping it in step with it       |
@@ -121,11 +121,10 @@ point layer is a 2D canvas over each pane that draws, picks and drags points in 
 | ------------------------- | ----------------------------------------------------------------- |
 | `mrfseg/settings.py`      | `MRFSettings`, its `BOUNDS` and validation (mirrored by the editor) |
 | `mrfseg/segmentation.py`  | `MRFSegmentation`: features (cached), generate, products          |
-| `mrfseg/mrf.py`           | the CRF (`Potentials`, `Clamps`) and its mean-field inference, plus the batched, differentiable version training uses |
-| `mrfseg/handcrafted.py`   | the Basic potentials: kernel-density unary from the points against the image's background, contrast-sensitive coupling |
-| `mrfseg/features.py`      | the feature grid and its memory cap, resampling, feature lookup, the HU copy the coupling reads |
-| `mrfseg/extractors.py`    | the table of extractors: how each is made, what settings it reads, how it makes the potentials |
-| `mrfseg/basic.py`         | the default extractor: multi-scale blurs, optional edges, shape   |
+| `mrfseg/rw.py`            | the random walker: the graph and its seeds, the multigrid-preconditioned conjugate-gradient solver, and the implicit gradient training uses |
+| `mrfseg/features.py`      | the feature grid and its memory cap, resampling, feature lookup, the HU copy the affinities and the seeds read |
+| `mrfseg/extractors.py`    | the table of extractors: how each is made, what settings it reads, how it makes the affinities |
+| `mrfseg/basic.py`         | the default extractor (the image itself) and Grady's contrast affinities |
 | `mrfseg/learned/`         | the network, its extractor, and everything that trains and measures it (see below) |
 | `mrfseg/windows.py`       | running a network over a volume in overlapping, blended windows   |
 | `mrfseg/surface.py`       | marching cubes on a map, in world space                           |
@@ -137,59 +136,57 @@ point layer is a 2D canvas over each pane that draws, picks and drags points in 
 | `mrfseg/server/`          | HTTP (`app.py`), sessions and background jobs, binary encodings   |
 
 **Features.** The settings name the extractor (`feature_extractor`), and `extractors.EXTRACTORS`
-says how to make it, which settings it reads, and how its features become the CRF's potentials;
-`MRFSegmentation` uses that unless it was given an extractor (and a potentials maker), as the
-tests and the training's validation do. The features are extracted again exactly when
+says how to make it, which settings it reads, and how its features become the graph's
+log-affinities; `MRFSegmentation` uses that unless it was given an extractor (and an affinity
+maker), as the tests and the training's validation do. The features are extracted again exactly when
 `extractors.features_key` changes: the extractor, its grid, and what it reads. Either runs once,
 on one isotropic grid (`feature_spacing`): the image's finest spacing floored at 0.5 mm by default
 (or the spacing the network was trained on), doubled until the grid fits the features' memory cap
-and the inference's (`segmentation.check_grids`). Resampling is one small matrix per axis (a
+and the solver's (`segmentation.check_grids`). Resampling is one small matrix per axis (a
 Gaussian, then linear interpolation), applied a few CT slices at a time, and a float16 copy of the
-resampled HU is kept beside the features for the contrast-sensitive coupling.
+resampled HU is kept beside the features for the contrast affinities and the background seeds.
 
-- **Basic** (`basic.py`, the default): blurs at sigma = 1, 2, 4... grid voxels, with each blur's
-  edge strength and Hessian eigenvalues if asked, each standardised over the image and all scaled
-  by 1/sqrt(C). Its potentials are handcrafted (`handcrafted.py`): a Gaussian is fitted to a
-  random sample of the image's features (background), and each voxel's unary logit is the log
-  ratio of the inside points' kernel density (Mahalanobis in the background's metric, times a
-  spatial kernel) to the background's, or to the background's mixed with the outside points'.
-  The coupling is Boykov & Jolly's in HU. Needs an inside point.
-- **Learned** (`learned/`): our own 3D U-Net (22.6 M parameters, four channels per voxel: the
-  unary logit and the raw couplings along +z, +y, +x), trained with `learned/train.py` on
-  coronary CTA with coronary label maps *through the mean-field inference* (`mrf.mean_field_batched`,
-  with simulated clicks clamped), so that the marginals reproduce the label map. It takes HU on
-  a fixed window at 0.5 mm, normalises per voxel over its channels (`model.ChannelNorm`) rather
-  than over the patch, and runs in windows of the training patch size (96³), half overlap,
-  Gaussian blending (`windows.py`), with empty click maps: the automatic potentials, kept as the
-  image's features. A Generate with points re-runs it in windows centred on the points, with the
-  click maps as input (`learned.network_input`), and blends the result into those
-  (`Learned.refine`); the potentials are the unary plus `unary_shift`, and `coupling` times the
-  softplus of the raw couplings (`model.PotentialNet.potentials`). The checkpoint is
-  `$MRFSEG_LEARNED_WEIGHTS` or `~/.cache/mrfseg/learned.pt`, loaded once per version of the
-  file; it carries its config, the spacing, and the settings the editor should start from
-  (`setting_defaults`: the sweeps it was trained through). Choosing it without a checkpoint is
-  an `InputError` with the training command, and `GET /extractors` says so beforehand, so the
-  editor greys it out. The training side -- `data.py` (patches, labels, simulated clicks),
-  `clicks.py` (the simulated user, shared with the evaluation and the training), `train.py`,
-  `evaluate.py` (a simulated user on test cubes, for both ways of making potentials) and
-  `prepare.py` (NIfTI pairs -> a 0.5 mm cache) -- is documented in the package and the README;
-  the editor never imports it.
+- **Basic** (`basic.py`, the default): the image itself is the one feature, and the
+  log-affinity of an edge is -(I_i - I_j)^2 / 2 delta^2 in HU (`contrast_log_affinities`,
+  `contrast`): Grady's random walker as published. Needs an inside point, as everything does.
+- **Learned** (`learned/`): our own 3D U-Net (22.6 M parameters, three channels per voxel: the
+  log-affinities of its edges along +z, +y, +x), trained with `learned/train.py` on coronary CTA
+  with coronary label maps in two stages -- edge targets, then the walker's own loss through the
+  implicit gradient (`rw.RandomWalkerFunction`). It takes HU on a fixed window at 0.5 mm and
+  nothing else (the points never reach it), normalises per voxel over its channels
+  (`model.ChannelNorm`) rather than over the patch, and runs in windows (96³ by default, half
+  overlap, Gaussian blending, `windows.py`) once per image: the log-affinities are the image's
+  features, and a Generate only seeds and solves. `affinity_scale` multiplies them. The
+  checkpoint is `$MRFSEG_LEARNED_WEIGHTS` or `~/.cache/mrfseg/learned.pt`, loaded once per
+  version of the file; it carries its config, the spacing, the inference window and the settings
+  the editor should start from (`setting_defaults`). Choosing it without a checkpoint is an
+  `InputError` with the training command, and `GET /extractors` says so beforehand, so the
+  editor greys it out. The training side -- `targets.py` (edge targets, the tree a seed selects),
+  `data.py` (patches, labels, one seed each), `clicks.py` (the simulated user, shared with the
+  evaluation and the validation), `train.py`, `evaluate.py` (the simulated user on whole scans,
+  for both ways of making affinities) and `prepare.py` (NIfTI pairs -> a 0.5 mm cache) -- is
+  documented in the package and the README; the editor never imports it.
 
-**The inference** (`mrf.py`) is checkerboard mean field: the field h_i = sum_j w_ij (2 m_j - 1)
-is computed for the whole volume with six shifted multiply-adds, one parity is updated to
-sigmoid(a + h), the clamps are reapplied, then the other parity; a sweep is both. It stops early
-once no marginal changes by more than 10^-3. The memory is about 34 bytes per voxel
-(`mrf.BYTES_PER_VOXEL`), capped at 100 M voxels (`MAX_MRF_BYTES`). The maps -- the marginal, the
-unary and the mean coupling at each voxel -- are read back onto the CT's grid a slice at a time
-(`mrf.resample_to`).
+**The solver** (`rw.py`) is the conjugate gradient method on L_FF p_F = -L_FS s, the
+matrix-vector product written edge by edge (`Level.apply`: w_ij (v_i - v_j) to row i and its
+negative to row j, then the seed edges and the sink on the diagonal), preconditioned by an
+aggregation multigrid cycle (`Multigrid`: 2 x 2 x 2 aggregates whose edges are the summed fine
+affinities between them, the Galerkin coarse operator, down to a grid solved densely; red-black
+Gauss-Seidel before and after the coarse correction, in mirrored order, so the cycle is
+symmetric). It stops once the cycle proposes no correction above `tolerance` at any voxel, or
+at `max_iterations`, and starts from the last probability when the affinities are unchanged.
+The memory is about 70 bytes per voxel (`rw.BYTES_PER_VOXEL`), capped at 100 M voxels
+(`MAX_GRID_BYTES`). The maps -- the probability and the mean log-affinity at each voxel -- are
+read back onto the CT's grid a slice at a time (`grid.resample_to`).
 
 **Generate** (`MRFSegmentation.generate_segmentation`) extracts the features if they are not
-there, builds the potentials from them and the points, clamps the points' voxels, runs the
-sweeps, keeps what the inside points connect to if `connected` is on (`select_connected`: the
-face-connected components of {p >= 0.5} holding an inside point; p is set to 0 on the others),
-and reads the maps onto the CT's grid: the values the user sees are the values used, and the
-same points and settings give the same maps. There is no Optimize: the handcrafted potentials
-have no fit, and the network's is its training.
+there, makes the affinities from them (`rw.affinities`: exp of the clamped log-affinities),
+seeds the points' voxels and, with `background_seeds`, every voxel below `seed_hu` eroded
+`seed_erosion` voxels (`Seeds.with_background`), solves the walker, counts the pieces of
+{p >= 0.5} (a diagnostic: more pieces than inside points means the solve did not converge, by
+the maximum principle), and reads the maps onto the CT's grid: the values the user sees are the
+values used, and the same points and settings give the same maps. There is no Optimize: the
+contrast affinities have no fit, and the network's is its training.
 
 **The server** wraps the core, which has no HTTP or UI code. Feature extraction and Generate run
 on background threads (one Generate at a time), and the editor polls the session for progress
@@ -213,15 +210,15 @@ rebinding). The editor's routes (`lib/server/local.ts`) serve only its own page,
   open, reset the views, points and segmentation, then open a backend session, which reads the
   same file and starts extracting features. Before the session opens, the backend is asked about
   the extractors once (`segmentation/extractors.ts`), so the first session already uses Learned
-  when its checkpoint is there; opening fills in the settings the image chooses (`IMAGE_DERIVED`,
-  but not a value the extractor brought, such as Learned's ℓ position).
+  when its checkpoint is there; opening fills in the settings the image chooses (`IMAGE_DERIVED`:
+  the feature grid, unless the extractor brought one).
 - **Choose an extractor** (`extractors.ts`): `chooseExtractor` writes `settingsForExtractor` into
   the settings -- the extractor, the grid left to the image, and the editor's defaults for the
-  potentials and the inference overlaid with the extractor's own values -- and records it in
-  `defaultsFrom`; `resetPotentials` writes that part again without touching the features.
+  affinities, the seeds and the solver overlaid with the extractor's own values -- and records
+  it in `defaultsFrom`; `resetPotentials` writes that part again without touching the features.
 - **Generate** (`segmentation/generate.ts`): connect if there is no session, *then* copy the
   settings (so they hold the image's choices), post the points, poll the job, then fetch the
-  three maps (compact int16/uint8) and store them as map datasets on the image's grid. The job
+  two maps (compact int16/uint8) and store them as map datasets on the image's grid. The job
   stays "running" (stage `maps`) until the maps and `generated` are stored together, so nothing
   can start another Generate in between. `generated` records the session it came from: a new
   session has no segmentation, so the maps are out of date under it (`staleReasons`). Only the
@@ -250,18 +247,18 @@ rebinding). The editor's routes (`lib/server/local.ts`) serve only its own page,
 
 ## Extending
 
-- **An MRF setting**: a field of `MRFSettings` in `mrfseg/settings.py`, with its validation (a
+- **A setting**: a field of `MRFSettings` in `mrfseg/settings.py`, with its validation (a
   bound in `BOUNDS`, or a place in `FLAGS`), and in `segmentation/settings.ts` a field of
   `MRFSettings`, a default and a `SETTING_GROUPS` entry; the panel draws its row from that table.
   `tests/settings.test.ts` checks the two sides agree, bounds included. A setting one extractor
   reads goes in that extractor's `reads` in `extractors.py`, and gets a `when` in the panel's
-  table; one of the potentials' or the inference's goes in `POTENTIAL_KEYS` too, so an extractor
-  may bring its own value for it.
+  table; one of the affinities', the seeds' or the solver's goes in `POTENTIAL_KEYS` too, so an
+  extractor may bring its own value for it.
 - **A feature extractor**: a class with `channels`, `unit_vectors` and
   `__call__(volume, device, progress) -> (C, z, y, x)` (`FeatureExtractor`; `input = "hu"` and
-  `native_spacing` if it wants them); a potentials maker (`extractors.PotentialsMaker`); an entry
-  in `extractors.EXTRACTORS` saying how to make it from the settings, which settings it reads and
-  whether it needs an inside point; and its name in `FeatureExtractorName` and `EXTRACTOR_LABELS`
+  `native_spacing` if it wants them); an affinity maker (`extractors.AffinityMaker`, giving the
+  log-affinities of the grid's edges); an entry in `extractors.EXTRACTORS` saying how to make it
+  from the settings and which settings it reads; and its name in `FeatureExtractorName` and `EXTRACTOR_LABELS`
   in `settings.ts`, from which the panel's dropdown is built. It is run once, on the whole
   feature grid; a network does that in windows with `windows.py`.
 - **A map**: a field of `Segmentation`, filled in `MRFSegmentation._maps`, and an entry in

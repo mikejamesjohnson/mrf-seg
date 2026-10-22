@@ -47,7 +47,7 @@ export interface MapSummary {
 
 export interface SegmentationResult {
   points: number;
-  seconds: { features: number; potentials: number; inference: number; maps: number };
+  seconds: { features: number; affinities: number; seeds: number; solve: number; maps: number };
   inference: InferenceSummary;
   maps: Record<MapQuantity, MapSummary>;
 }
@@ -89,7 +89,7 @@ export function toCamelCase(fields: object): Record<string, unknown> {
 }
 
 /** How each map comes with `?encoding=compact` (`mrfseg/server/encoding.py`). */
-const COMPACT_TYPES = { unary: Int16Array, coupling: Int16Array, probability: Uint8Array } as const;
+const COMPACT_TYPES = { affinity: Int16Array, probability: Uint8Array } as const;
 
 async function call(path: string, init?: RequestInit): Promise<Response> {
   let response: Response;
@@ -129,7 +129,7 @@ export async function sessionStatus(sessionId: string): Promise<SessionStatus> {
   return { features, job };
 }
 
-/** Start building the potentials from the points and inferring the maps; poll `sessionStatus` for the result. */
+/** Start seeding the walker with the points and solving it; poll `sessionStatus` for the result. */
 export async function startSegmentation(sessionId: string, points: Vec3[], labels: number[], settings: MRFSettings): Promise<void> {
   await call(`sessions/${sessionId}/segmentation`, postJson({ points, labels, settings: toSnakeCase(settings) }));
 }

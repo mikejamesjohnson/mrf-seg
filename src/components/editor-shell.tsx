@@ -6,7 +6,7 @@ import { useEffect } from "react";
 import { GeneratePanel } from "@/components/panels/generate-panel";
 import { ImagePanel } from "@/components/panels/image-panel";
 import { PointsPanel } from "@/components/panels/points-panel";
-import { FeaturesPanel, InferencePanel, PairwisePanel, UnaryPanel } from "@/components/panels/segmentation-panel";
+import { FeaturesPanel, SeedsPanel, SolverPanel } from "@/components/panels/segmentation-panel";
 import { StatusBar } from "@/components/status-bar";
 import { Toolbar } from "@/components/toolbar";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
@@ -96,17 +96,14 @@ export function EditorShell() {
             <PanelSection title="Image">
               <ImagePanel />
             </PanelSection>
-            <PanelSection title="Feature extraction">
+            <PanelSection title="Affinities">
               <FeaturesPanel />
             </PanelSection>
-            <PanelSection title="Unary potential">
-              <UnaryPanel />
+            <PanelSection title="Seeds">
+              <SeedsPanel />
             </PanelSection>
-            <PanelSection title="Pairwise potential">
-              <PairwisePanel />
-            </PanelSection>
-            <PanelSection title="Inference">
-              <InferencePanel />
+            <PanelSection title="Solver">
+              <SolverPanel />
             </PanelSection>
             <PanelSection title="Points">
               <PointsPanel />

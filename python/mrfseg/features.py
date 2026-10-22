@@ -3,11 +3,12 @@
 The image is resampled to an isotropic grid of about `feature_spacing` mm, normalised to
 [0, 1] (or left in HU, for a network trained on HU), and run once through a feature extractor;
 the result is kept as float16, C features per feature voxel, beside a float16 copy of the
-resampled image in HU (`FeatureVolume.intensity`), which the contrast-sensitive coupling reads.
+resampled image in HU (`FeatureVolume.intensity`), which the contrast affinities and the
+background seeds read.
 The extractors themselves are in `extractors.py` (Basic, and the learned network); this module
 knows only what one must provide (`FeatureExtractor`).
 
-The feature grid is also the grid the CRF is inferred on (`mrf.py`): isotropic, so every edge
+The feature grid is also the grid the walker is solved on (`rw.py`): isotropic, so every edge
 has one length. The clicks' features are read at *any* point, so `FeatureVolume` interpolates
 trilinearly. An extractor says how its features are compared (`unit_vectors`): a network's may
 be scaled to unit length at every sample, so distances lie in [0, 2] whatever its output scale;
@@ -128,7 +129,7 @@ class FeatureVolume:
     """Whether each sample is scaled to unit length (a network's), or used as it is (Basic's)."""
     intensity: np.ndarray | None = None
     """(z, y, x) float16: the image resampled to the feature grid, in its own units (HU), for
-    the contrast-sensitive coupling. None for features made without it (tests)."""
+    the contrast affinities and the background seeds. None for features made without it (tests)."""
 
     @property
     def channels(self) -> int:

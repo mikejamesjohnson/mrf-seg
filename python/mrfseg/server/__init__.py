@@ -14,10 +14,11 @@ port. JSON in and out, except the maps and the mesh:
     GET    /sessions/<id>                      {"id", "features": task, "job": task}, for polling
     POST   /sessions/<id>/segmentation         {"points": [[x, y, z], ...], "labels": [1 | -1, ...], "settings"?} -> 202,
                                                or 400 if the points or settings cannot be used; the job's result is
-                                               {"points", "seconds", "inference": {"sweeps", "delta", "converged", "components"}, "maps"}
-    GET    /sessions/<id>/segmentation/<map>   unary | coupling | probability, float32, x fastest;
+                                               {"points", "seconds", "inference": {"iterations", "residual", "converged",
+                                               "components", "seeds": {"inside", "outside", "background"}}, "maps"}
+    GET    /sessions/<id>/segmentation/<map>   affinity | probability, float32, x fastest;
                                                ?encoding=compact for the editor's encoding (`encoding.py`)
-    POST   /sessions/<id>/surface              {"source": "probability" | "unary", "level"?} -> mesh summary
+    POST   /sessions/<id>/surface              {"source": "probability", "level"?} -> mesh summary
     GET    /sessions/<id>/surface              the mesh, binary (`encoding.mesh_bytes`)
     POST   /sessions/<id>/labelmap             {"threshold"?} -> {"threshold", "voxels", "seconds"}
     GET    /sessions/<id>/labelmap             the labelmap, uint8 (1 where p >= threshold), x fastest

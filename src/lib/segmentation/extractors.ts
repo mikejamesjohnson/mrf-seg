@@ -38,7 +38,7 @@ export function chooseExtractor(extractor: FeatureExtractorName): void {
   store().setSegmentation({ defaultsFrom: extractor });
 }
 
-/** Put the current extractor's potential and inference settings back, leaving the features as they are. */
+/** Put the current extractor's affinity, seed and solver settings back, leaving the features as they are. */
 export function resetPotentials(): void {
   const { featureExtractor } = store().segmentation.settings;
   const { featureExtractor: _extractor, featureSpacing: _spacing, ...potentials } = settingsForExtractor(featureExtractor, store().extractors[featureExtractor]);

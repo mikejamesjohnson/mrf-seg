@@ -1,4 +1,4 @@
-"""MRFSegmentation: segmenting one image with a conditional random field and mean field."""
+"""MRFSegmentation: segmenting one image with the random walker on learned (or contrast) affinities."""
 
 from __future__ import annotations
 
@@ -8,67 +8,66 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
-from scipy import ndimage
 from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPolyData
 
 from .compute import Progress, resolve_device
 from .errors import InputError, is_number
-from .extractors import PotentialsMaker, extractor_spec, features_key, make_extractor
+from .extractors import AffinityMaker, extractor_spec, features_key, make_extractor
 from .features import FeatureExtractor, FeatureVolume, check_feature_grid, extract_features, feature_grid_dims
-from .grid import Grid, image_like, voxels
-from .mrf import Clamps, MeanFieldResult, Potentials, check_grid, mean_field, resample_to
+from .grid import Grid, image_like, resample_to, voxels
+from .rw import RandomWalkerResult, Seeds, affinities, check_grid, components, mean_log_affinity, random_walker
 from .settings import MRFSettings
 from .surface import extract_surface
 
-#: The handcrafted unary keeps a (voxels of a slice x points) kernel; past a few hundred points
-#: that is gigabytes, and nobody clicks that often.
+#: More points than anyone clicks; the seeds are dense anyway, so this only bounds a request.
 MAX_POINTS = 500
 #: How far outside the outermost voxel centres a point may be, in voxels: a point clamped to
 #: the edge of an oblique grid does not project back exactly onto it.
 INSIDE_TOLERANCE = 1e-3
-#: The labelmap's connectivity: face neighbours, as the CRF's edges.
-SIX = ndimage.generate_binary_structure(3, 1)
 
 
 @dataclass(frozen=True)
 class InferenceSummary:
-    """How the mean-field inference ended."""
+    """How the walker's solve ended."""
 
-    sweeps: int
-    """Full sweeps made (fewer than asked when it converged early)."""
-    delta: float
-    """The largest change of any marginal in the last sweep."""
+    iterations: int
+    """Conjugate-gradient iterations made."""
+    residual: float
+    """The largest correction the preconditioner still proposed (`rw.SolverOptions.tolerance`)."""
     converged: bool
-    components: int | None = None
-    """How many connected components the inside points kept (`MRFSettings.connected`); None
-    when nothing was dropped: the rule is off, or there were no inside points."""
+    components: int
+    """How many face-connected pieces {p >= 0.5} has. By the maximum principle each holds an
+    inside point, so more pieces than inside points means the solve did not converge."""
+    seeds: dict[str, int] = field(default_factory=dict)
+    """How many seeds of each kind: "inside" and "outside" points, "background"."""
 
 
 @dataclass(frozen=True)
 class Segmentation:
-    """Three float32 images on the reference volume's grid, and how they were made."""
+    """Two float32 images on the reference volume's grid, and how they were made."""
 
     probability: vtkImageData
-    """p(y = 1 | image, clicks): the mean-field marginal, the chance a voxel is inside."""
-    unary: vtkImageData
-    """a: the unary logit. Positive is evidence for inside, before the coupling has its say."""
-    coupling: vtkImageData
-    """The mean coupling of the edges at each voxel: high where a label change is expensive."""
+    """p(y = 1 | image, points): the walker's probability of reaching an inside point first."""
+    affinity: vtkImageData
+    """The mean log-affinity of the edges at each voxel: positive where the label flows freely,
+    negative where it is held back (a wall)."""
     inference: InferenceSummary
     seconds: dict[str, float] = field(default_factory=dict)
-    """How long each step took: features (0 when they were already there), potentials, inference, maps."""
+    """How long each step took: features (0 when they were already there), affinities, seeds, solve, maps."""
 
 
 class MRFSegmentation:
-    """Conditional-random-field segmentation of a reference volume.
+    """Random-walker segmentation of a reference volume.
 
-    Keeps state between segmentations: the volume's features, extracted once per setting,
-    and the last segmentation. Positions are world coordinates, LPS mm, like the volume's.
+    Keeps state between segmentations: the volume's features, extracted once per setting, the
+    last segmentation, and the last probability on the solver's grid, which the next solve
+    starts from when the affinities have not changed (a new point changes the solution near
+    itself most). Positions are world coordinates, LPS mm, like the volume's.
 
     The settings choose the feature extractor (`MRFSettings.feature_extractor`), and with it how
-    the potentials are made (`extractors.EXTRACTORS`). One given here is used instead, whatever
-    they say: for tests, or an extractor of your own; its potentials are then made by `potentials`
-    (an `extractors.PotentialsMaker`), the handcrafted ones unless given.
+    the affinities are made (`extractors.EXTRACTORS`). One given here is used instead, whatever
+    they say: for tests, or an extractor of your own; its affinities are then made by
+    `affinities` (an `extractors.AffinityMaker`), the contrast ones unless given.
     """
 
     def __init__(
@@ -76,11 +75,11 @@ class MRFSegmentation:
         reference_volume: vtkImageData | None = None,
         settings: MRFSettings | None = None,
         feature_extractor: FeatureExtractor | None = None,
-        potentials: PotentialsMaker | None = None,
+        affinities: AffinityMaker | None = None,
     ) -> None:
         self._reference_volume: vtkImageData | None = None
         self._given_extractor = feature_extractor
-        self._given_potentials = potentials
+        self._given_affinities = affinities
         self.settings = settings or MRFSettings()
         self.reference_volume = reference_volume
 
@@ -108,6 +107,7 @@ class MRFSegmentation:
         self._settings = self._requested.resolved_for(volume)
         self._features: FeatureVolume | None = None
         self._features_for: tuple | None = None
+        self._last_probability: tuple[tuple, torch.Tensor] | None = None
         self.last_segmentation: Segmentation | None = None
 
     @property
@@ -124,14 +124,13 @@ class MRFSegmentation:
         return self._given_extractor if self._given_extractor is not None else make_extractor(self.settings)
 
     def needs_inside_point(self) -> bool:
-        """Whether a Generate needs an inside point: the handcrafted unary does, the network does not."""
-        if self._given_extractor is not None:
-            return self._given_potentials is None
-        return extractor_spec(self.settings.feature_extractor).needs_inside_point
+        """Whether a Generate needs an inside point: always, for the walker -- without one
+        nothing is selected."""
+        return True
 
     def check_settings(self, settings: MRFSettings | None = None) -> None:
         """An InputError if `settings` (the current ones, if not given) cannot be used on the
-        reference volume: a feature grid too large for memory, or for the inference."""
+        reference volume: a feature grid too large for memory, or for the solver."""
         volume = self._require_volume()
         settings = (settings or self._requested).resolved_for(volume)
         channels = (self._given_extractor or make_extractor(settings)).channels
@@ -143,6 +142,7 @@ class MRFSegmentation:
         if not self.has_features():
             self.check_settings()
             self._features = None  # let the old ones go before making new ones
+            self._last_probability = None
             device = resolve_device(self.settings.device)
             self._features = extract_features(volume, self.settings.feature_spacing, self.feature_extractor(), device, progress)
             self._features_for = features_key(self.settings)
@@ -175,8 +175,8 @@ class MRFSegmentation:
         progress: Progress | None = None,
         stage: Callable[[str], None] | None = None,
     ) -> Segmentation:
-        """Build the CRF's potentials from the features and the labelled points, infer the
-        marginals with the points clamped, and read the maps onto the reference volume's grid.
+        """Build the graph's affinities from the features, seed it with the labelled points (and
+        the background), solve the walker, and read the maps onto the reference volume's grid.
 
         `points` are (n, 3) world positions inside the image, `labels` +1 inside and -1
         outside. `stage(name)` and `progress(fraction)` report where it has got to. The last
@@ -196,55 +196,69 @@ class MRFSegmentation:
         seconds["features"] = 0.0 if had_features else time.perf_counter() - started
 
         device = resolve_device(self.settings.device)
-        report("potentials")
+        report("affinities")
         started = time.perf_counter()
-        potentials = self._potentials(features, grid, points, labels, device, progress)
-        clamps = Clamps.from_voxels(features.ct_to_feature_index(grid.world_to_index(points)), labels, features.shape, device)
-        seconds["potentials"] = time.perf_counter() - started
+        w = affinities(self._log_affinities(features, device, progress))
+        seconds["affinities"] = time.perf_counter() - started
 
-        report("inference")
+        report("seeds")
         started = time.perf_counter()
-        result = mean_field(potentials, clamps, self.settings.sweeps, progress)
-        components = select_connected(result.marginal, clamps) if self.settings.connected else None
-        seconds["inference"] = time.perf_counter() - started
+        seeds = self._seeds(features, grid, points, labels, device)
+        seconds["seeds"] = time.perf_counter() - started
+
+        report("solve")
+        started = time.perf_counter()
+        key = (self._features_for, self.settings.affinity_key())
+        initial = self._last_probability[1] if self._last_probability is not None and self._last_probability[0] == key else None
+        result = random_walker(w, seeds, self.settings.solver, progress, initial)
+        self._last_probability = (key, result.probability)
+        pieces = components(result.probability)
+        seconds["solve"] = time.perf_counter() - started
 
         report("maps")
         started = time.perf_counter()
         self.last_segmentation = None  # its memory is free for the new maps
-        segmentation = self._maps(volume, potentials, result, components, progress)
+        summary = InferenceSummary(result.iterations, result.residual, result.converged, pieces, seeds.counts())
+        segmentation = self._maps(volume, w, result, summary, progress)
         seconds["maps"] = time.perf_counter() - started
         self.last_segmentation = replace(segmentation, seconds=seconds)
         return self.last_segmentation
 
-    def _potentials(self, features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray, device: torch.device, progress: Progress | None) -> Potentials:
-        """The potentials the extractor's spec makes from its features; for an extractor given to
-        the constructor, the maker given with it, or the handcrafted ones."""
+    def _log_affinities(self, features: FeatureVolume, device: torch.device, progress: Progress | None) -> torch.Tensor:
+        """The log-affinities the extractor's spec makes from its features; for an extractor
+        given to the constructor, the maker given with it, or the contrast ones."""
         if self._given_extractor is not None:
-            if self._given_potentials is not None:
-                return self._given_potentials(self._given_extractor, features, grid, points, labels, self.settings, device, progress)
-            from .handcrafted import handcrafted_potentials
+            if self._given_affinities is not None:
+                return self._given_affinities(self._given_extractor, features, self.settings, device, progress)
+            from .extractors import _basic
 
-            return handcrafted_potentials(features, grid, points, labels, self.settings.handcrafted, device, progress)
+            return _basic(self._given_extractor, features, self.settings, device, progress)
         spec = extractor_spec(self.settings.feature_extractor)
-        return spec.potentials(self.feature_extractor(), features, grid, points, labels, self.settings, device, progress)
+        return spec.affinities(self.feature_extractor(), features, self.settings, device, progress)
+
+    def _seeds(self, features: FeatureVolume, grid: Grid, points: np.ndarray, labels: np.ndarray, device: torch.device) -> Seeds:
+        """The points as seeds on the feature grid (the nearest voxel to each), and the
+        background below `seed_hu` if the settings ask for it."""
+        seeds = Seeds.from_voxels(features.ct_to_feature_index(grid.world_to_index(points)), labels, features.shape, device)
+        if self.settings.background_seeds:
+            if features.intensity is None:
+                raise InputError("The features carry no intensity grid for the background seeds")
+            intensity = torch.from_numpy(np.asarray(features.intensity, dtype=np.float32)).to(device)
+            seeds = seeds.with_background(intensity, self.settings.seed_hu, self.settings.seed_erosion)
+        return seeds
 
     def extract_surface(self, source: str = "probability", level: float | None = None) -> vtkPolyData:
         """A triangle mesh of the last segmentation's boundary: the probability's `level` set
-        (0.5 unless given), or the unary logit's (0 unless given), the evidence alone."""
+        (0.5 unless given)."""
         segmentation = self._require_segmentation()
-        if source == "probability":
-            return extract_surface(segmentation.probability, _probability_level(0.5 if level is None else level))
-        if source == "unary":
-            if level is not None and not is_number(level):
-                raise InputError(f"A unary level must be a finite number, not {level!r}")
-            return extract_surface(segmentation.unary, 0.0 if level is None else level)
-        raise InputError(f"Unknown surface source {source!r}: 'probability' or 'unary'")
+        if source != "probability":
+            raise InputError(f"Unknown surface source {source!r}: 'probability'")
+        return extract_surface(segmentation.probability, _probability_level(0.5 if level is None else level))
 
     def labelmap(self, threshold: float = 0.5) -> vtkImageData:
         """The last segmentation's voxels with p(y = 1) >= `threshold`, as a uint8 image on the
-        reference grid: 1 inside, 0 outside. Connectivity to the inside points is the
-        probability's own business (`MRFSettings.connected`), so the labelmap and the surface
-        at one threshold agree."""
+        reference grid: 1 inside, 0 outside. Every piece of it holds an inside point (the
+        maximum principle), so the labelmap and the surface at one threshold agree."""
         segmentation = self._require_segmentation()
         level = _probability_level(threshold)
         image, labels = image_like(segmentation.probability, "label", np.uint8)
@@ -268,28 +282,26 @@ class MRFSegmentation:
             raise InputError("No segmentation yet: generate one first")
         return self.last_segmentation
 
-    def _maps(self, volume: vtkImageData, potentials: Potentials, result: MeanFieldResult, components: int | None, progress: Progress | None) -> Segmentation:
-        """The marginal, the unary and the mean coupling read onto the CT's grid, a slice at a time."""
+    def _maps(self, volume: vtkImageData, w: torch.Tensor, result: RandomWalkerResult, summary: InferenceSummary, progress: Progress | None) -> Segmentation:
+        """The probability and the mean log-affinity read onto the CT's grid, a slice at a time."""
         dims = volume.GetDimensions()
         probability_image, probability = image_like(volume, "probability")
-        unary_image, unary = image_like(volume, "unary")
-        coupling_image, coupling = image_like(volume, "coupling")
-        sources = {"probability": result.marginal, "unary": potentials.unary, "coupling": potentials.mean_coupling()}
-        targets = {"probability": probability, "unary": unary, "coupling": coupling}
+        affinity_image, affinity = image_like(volume, "affinity")
+        sources = {"probability": result.probability, "affinity": mean_log_affinity(w)}
+        targets = {"probability": probability, "affinity": affinity}
         nz = dims[2]
         for k in range(nz):
             for name, source in sources.items():
                 targets[name][k] = resample_to(source, dims, k).cpu().numpy()
             if progress:
                 progress((k + 1) / nz)
-        inference = InferenceSummary(result.sweeps, result.delta, result.converged, components)
-        return Segmentation(probability_image, unary_image, coupling_image, inference)
+        return Segmentation(probability_image, affinity_image, summary)
 
 
 def check_grids(ct_dims: tuple[int, int, int], ct_spacing: tuple[float, float, float], spacing: float, channels: int) -> None:
     """An InputError if the feature grid of `spacing` mm is too large for the features' memory
-    (`features.check_feature_grid`) or to infer in (`mrf.check_grid`), saying what spacing would
-    satisfy both."""
+    (`features.check_feature_grid`) or for the solver (`rw.check_grid`), saying what spacing
+    would satisfy both."""
 
     def check(candidate: float) -> None:
         check_feature_grid(ct_dims, ct_spacing, candidate, channels)
@@ -314,23 +326,3 @@ def _probability_level(threshold: float) -> float:
     if not (is_number(threshold) and 0 < threshold < 1):
         raise InputError(f"A probability threshold must be between 0 and 1, not {threshold!r}")
     return float(threshold)
-
-
-def select_connected(marginal: torch.Tensor, clamps: Clamps) -> int | None:
-    """In place: of the face-connected components of {marginal >= 0.5} on the grid, keep those
-    that hold an inside clamp and set the marginal to 0 on the others; voxels below 0.5 are left
-    as they are. The number kept; None, and nothing changed, without inside clamps."""
-    inside = clamps.inside()
-    if len(inside) == 0:
-        return None
-    labels = (marginal >= 0.5).cpu().numpy()
-    components, count = ndimage.label(labels, structure=SIX)
-    seeds = inside.cpu().numpy()
-    keep = np.unique(components[seeds[:, 0], seeds[:, 1], seeds[:, 2]])
-    keep = keep[keep > 0]
-    dropped = np.ones(count + 1, dtype=bool)
-    dropped[0] = False  # below the threshold: not a component
-    dropped[keep] = False
-    mask = torch.from_numpy(dropped[components]).to(marginal.device)
-    marginal.masked_fill_(mask, 0.0)
-    return int(len(keep))

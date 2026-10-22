@@ -254,8 +254,14 @@ def _finite_range(name: str, values: np.ndarray) -> tuple[float, float]:
 
 
 def _inference_summary(inference: InferenceSummary) -> dict:
-    """`InferenceSummary` in `src/lib/segmentation/state.ts`: how the mean field ended."""
-    return {"sweeps": inference.sweeps, "delta": inference.delta, "converged": inference.converged, "components": inference.components}
+    """`InferenceSummary` in `src/lib/segmentation/state.ts`: how the walker's solve ended."""
+    return {
+        "iterations": inference.iterations,
+        "residual": inference.residual,
+        "converged": inference.converged,
+        "components": inference.components,
+        "seeds": dict(inference.seeds),
+    }
 
 
 def _job_summary(segmentation: Segmentation, points: int, ranges: dict[str, tuple[float, float]], scales: dict[str, float]) -> dict:

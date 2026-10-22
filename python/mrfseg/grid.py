@@ -81,3 +81,24 @@ class Grid:
         steps = torch.from_numpy(self.axes * self.spacing)  # column a: one step along voxel axis a
         in_plane = i.reshape(-1, 1) * steps[:, 0] + j.reshape(-1, 1) * steps[:, 1] + torch.from_numpy(self.origin - self.center)
         return lambda k: (in_plane + k * steps[:, 2]).to(device=device, dtype=torch.float32)
+
+
+def resample_to(volume: torch.Tensor, dims: tuple[int, int, int], k: int) -> torch.Tensor:
+    """Slice `k` (of `dims[2]`) of a (z, y, x) `volume` resampled trilinearly onto a grid of
+    `dims` (x, y, z) spanning the same outermost voxel centres: (ny, nx). This is how a map on
+    the feature grid is read on the CT's grid, a CT slice at a time."""
+    import math
+
+    import torch.nn.functional as F
+
+    nx, ny, nz = dims
+    fz = volume.shape[0]
+    z = k * ((fz - 1) / (nz - 1)) if nz > 1 else 0.0
+    z0 = min(int(math.floor(z)), max(fz - 2, 0))
+    t = z - z0
+    plane = volume[z0]
+    if t > 0 and z0 + 1 < fz:
+        plane = (1 - t) * plane + t * volume[z0 + 1]
+    if plane.shape != (ny, nx):
+        plane = F.interpolate(plane[None, None], size=(ny, nx), mode="bilinear", align_corners=True)[0, 0]
+    return plane
